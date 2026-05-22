@@ -69,6 +69,29 @@ def _zone_for(room_type: str, cluster: str) -> str:
     return "center"
 
 
+def _extract_prefer_edge(notes: str, room_type: str) -> str:
+    """Extract position preference from room notes.
+
+    Converts Chinese position hints to edge labels used by grid compiler.
+    """
+    # Default edge preferences by room type
+    defaults = {"客厅": "south", "阳台": "south"}
+    if not notes:
+        return defaults.get(room_type, "")
+
+    pos_map = {
+        "右下": "south", "左下": "south", "下": "south", "南侧": "south", "南": "south",
+        "右上": "north", "左上": "north", "上": "north", "北侧": "north", "北": "north",
+        "右侧": "east", "右": "east", "东侧": "east", "东": "east",
+        "左侧": "west", "左": "west", "西侧": "west", "西": "west",
+        "中间": "", "中心": "",
+    }
+    for kw, edge in pos_map.items():
+        if kw in notes:
+            return edge
+    return defaults.get(room_type, "")
+
+
 def build_default_semantic_plan(plan: PlannerFinalPlan) -> SemanticLayoutPlan:
     placements: list[RoomPlacement] = []
     public_order: list[str] = []
@@ -79,6 +102,8 @@ def build_default_semantic_plan(plan: PlannerFinalPlan) -> SemanticLayoutPlan:
         cluster = _cluster_for(item.room_type)
         zone = _zone_for(item.room_type, cluster)
         size = "large" if (item.target_area_sqm or 0) >= 14 else "medium" if (item.target_area_sqm or 0) >= 8 else "small"
+        # Extract position hint from notes (e.g. "用户要求：右下角")
+        prefer_edge = _extract_prefer_edge(item.notes or "", item.room_type)
         for idx in range(max(1, item.count)):
             name = item.room_type if item.count == 1 else f"{item.room_type}{idx + 1}"
             placements.append(
@@ -87,7 +112,7 @@ def build_default_semantic_plan(plan: PlannerFinalPlan) -> SemanticLayoutPlan:
                     zone=zone,  # type: ignore[arg-type]
                     size=size,  # type: ignore[arg-type]
                     cluster=cluster,  # type: ignore[arg-type]
-                    prefer_edge="south" if item.room_type in ("客厅", "阳台") else "",
+                    prefer_edge=prefer_edge,
                     index=idx + 1,
                 )
             )

@@ -248,10 +248,11 @@ function LayoutSvgRenderer({
   }
   const xs = allPts.map((p) => p.x);
   const ys = allPts.map((p) => p.y);
-  const minX = Math.min(...xs, 0) - 0.5;
-  const minY = Math.min(...ys, 0) - 0.5;
-  const maxX = Math.max(...xs) + 0.5;
-  const maxY = Math.max(...ys) + 0.5;
+  const pad = 0.8;
+  const minX = Math.min(...xs, 0) - pad;
+  const minY = Math.min(...ys, 0) - pad;
+  const maxX = Math.max(...xs) + pad;
+  const maxY = Math.max(...ys) + pad;
   const vw = maxX - minX || 1;
   const vh = maxY - minY || 1;
 
@@ -270,15 +271,28 @@ function LayoutSvgRenderer({
     { fill: "#e0e7ff", stroke: "#6366f1" },
   ];
 
+  // Grid lines
+  const gridMin = Math.floor(minX);
+  const gridMax = Math.ceil(maxX);
+  const gridMinY = Math.floor(minY);
+  const gridMaxY = Math.ceil(maxY);
+
   return (
-    <svg className="w-full" viewBox={`${minX} ${minY} ${vw} ${vh}`} style={{ maxHeight: "50vh" }}>
-      {Array.from({ length: Math.ceil(maxX) + 1 }, (_, i) => (
-        <line key={`gx${i}`} x1={i} y1={minY} x2={i} y2={maxY} stroke="#f1f5f9" strokeWidth="0.03" />
+    <svg
+      className="w-full"
+      viewBox={`${minX} ${minY} ${vw} ${vh}`}
+      style={{ maxHeight: "55vh" }}
+      fontFamily="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', 'Noto Sans SC', sans-serif"
+    >
+      {/* Background grid */}
+      {Array.from({ length: gridMax - gridMin + 1 }, (_, i) => (
+        <line key={`gx${i}`} x1={gridMin + i} y1={minY} x2={gridMin + i} y2={maxY} stroke="#f1f5f9" strokeWidth="0.03" />
       ))}
-      {Array.from({ length: Math.ceil(maxY) + 1 }, (_, i) => (
-        <line key={`gy${i}`} x1={minX} y1={i} x2={maxX} y2={i} stroke="#f1f5f9" strokeWidth="0.03" />
+      {Array.from({ length: gridMaxY - gridMinY + 1 }, (_, i) => (
+        <line key={`gy${i}`} x1={minX} y1={gridMinY + i} x2={maxX} y2={gridMinY + i} stroke="#f1f5f9" strokeWidth="0.03" />
       ))}
 
+      {/* Outline */}
       {outlineVerts.length >= 3 && (
         <polygon
           points={outlineVerts.map((v) => `${v.x},${v.y}`).join(" ")}
@@ -289,6 +303,7 @@ function LayoutSvgRenderer({
         />
       )}
 
+      {/* Rooms */}
       {rooms.map((room, idx) => {
         const c = roomColors[idx % roomColors.length];
         return <RoomShape key={room.room_id} room={room} fill={c.fill} stroke={c.stroke} />;
@@ -303,6 +318,20 @@ function RoomShape({ room, fill, stroke }: { room: LayoutRoom; fill: string; str
 
   const { x: cx, y: cy } = polygonLabelCenter(pts);
   const isPoly = room.shape_kind === "polygon" || pts.length > 4;
+  const area = room.area_sqm ?? 0;
+
+  // Adaptive font sizes based on room area
+  let nameFs: number;
+  let areaFs: number;
+  if (area >= 14) {
+    nameFs = 0.40; areaFs = 0.28;
+  } else if (area >= 8) {
+    nameFs = 0.34; areaFs = 0.24;
+  } else if (area >= 4) {
+    nameFs = 0.28; areaFs = 0.19;
+  } else {
+    nameFs = 0.22; areaFs = 0.15;
+  }
 
   return (
     <g>
@@ -317,12 +346,20 @@ function RoomShape({ room, fill, stroke }: { room: LayoutRoom; fill: string; str
         vectorEffect="non-scaling-stroke"
         className={isPoly ? "fpw-room-poly" : "fpw-room-rect"}
       />
-      <text x={cx} y={cy - 0.12} textAnchor="middle" fontSize="0.32" fill="#1e293b" fontWeight="600">
-        {room.name}
-      </text>
-      <text x={cx} y={cy + 0.22} textAnchor="middle" fontSize="0.22" fill="#64748b">
-        {room.area_sqm.toFixed(1)}㎡
-      </text>
+      {area < 3 ? (
+        <text x={cx} y={cy + nameFs * 0.35} textAnchor="middle" fontSize={nameFs} fill="#1e293b" fontWeight="600">
+          {room.name}
+        </text>
+      ) : (
+        <>
+          <text x={cx} y={cy - nameFs * 0.25} textAnchor="middle" fontSize={nameFs} fill="#1e293b" fontWeight="600">
+            {room.name}
+          </text>
+          <text x={cx} y={cy + areaFs * 0.75} textAnchor="middle" fontSize={areaFs} fill="#64748b">
+            {area.toFixed(1)}㎡
+          </text>
+        </>
+      )}
     </g>
   );
 }

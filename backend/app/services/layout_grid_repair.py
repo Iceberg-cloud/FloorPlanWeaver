@@ -225,6 +225,9 @@ def _force_rect(state: SearchState, grid: GridMap, rid: int) -> None:
 
     Claims unassigned cells and re-assigns flexible-room cells (living/dining)
     inside the bbox to ensure a complete rectangular shape.
+
+    After displacing flexible rooms, attempts to compensate them with
+    nearby free cells to minimize area loss.
     """
     cells = [(i, j) for j in range(grid.rows) for i in range(grid.cols)
              if grid.inside[j][i] and state.rid[j][i] == rid]
@@ -259,6 +262,43 @@ def _force_rect(state: SearchState, grid: GridMap, rid: int) -> None:
                 continue
             if state.rid[j][i] == 0:
                 state.rid[j][i] = rid
+
+    # Compensate displaced flexible rooms with nearby free cells
+    for other_rid, lost_cells in displaced.items():
+        lost_count = len(lost_cells)
+        if lost_count == 0:
+            continue
+
+        # Find free cells adjacent to the displaced room's remaining cells
+        remaining = [(i, j) for j in range(grid.rows) for i in range(grid.cols)
+                     if grid.inside[j][i] and state.rid[j][i] == other_rid]
+        if not remaining:
+            continue
+
+        remaining_set = set(remaining)
+        compensated = 0
+        visited: set[tuple[int, int]] = set()
+
+        # BFS from remaining cells to find nearby free cells
+        queue: deque[tuple[int, int]] = deque()
+        for ci, cj in remaining:
+            for ni, nj in ((ci + 1, cj), (ci - 1, cj), (ci, cj + 1), (ci, cj - 1)):
+                if (ni, nj) not in visited and 0 <= ni < grid.cols and 0 <= nj < grid.rows:
+                    if grid.inside[nj][ni] and state.rid[nj][ni] == 0:
+                        visited.add((ni, nj))
+                        queue.append((ni, nj))
+
+        while queue and compensated < lost_count:
+            fi, fj = queue.popleft()
+            if state.rid[fj][fi] == 0:
+                state.rid[fj][fi] = other_rid
+                compensated += 1
+                # Add neighbors of the newly claimed cell
+                for ni, nj in ((fi + 1, fj), (fi - 1, fj), (fi, fj + 1), (fi, fj - 1)):
+                    if (ni, nj) not in visited and 0 <= ni < grid.cols and 0 <= nj < grid.rows:
+                        if grid.inside[nj][ni] and state.rid[nj][ni] == 0:
+                            visited.add((ni, nj))
+                            queue.append((ni, nj))
 
 
 def _cells_single_rect(state: SearchState, grid: GridMap, rid: int) -> bool:

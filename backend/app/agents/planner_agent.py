@@ -380,6 +380,17 @@ class PlannerAgent:
             goals.append(f"满足用户特殊要求：{pref_text}")
         return goals
 
+    # ── Modification intent detection ────────────────────────────
+    # Patterns indicating the user is giving a *modification* instruction
+    # rather than describing a *new* room list.
+    _MODIFICATION_PATTERN = re.compile(
+        r"(请|把|将|让|要|希望|能不能|可以|能否).*?"
+        r"(移动|移到|移至|搬到|换|改|调整|增大|缩小|删除|去掉|放到|安排到|调到|变|换成|替换)"
+        r"|(不要|去掉|删除|取消).{0,6}(房间|卧室|厨房|卫生间|阳台|客厅|餐厅|书房)"
+        r"|(移动|移到|移至|搬到|放到|安排到|调到).{0,10}(左|右|上|下|角|边|侧)"
+        r"|(改|调整|换).{0,6}(一下|一个|到|至|去)?"
+    )
+
     def _extract_to_collected(self, text: str, collected: dict) -> None:
         if any(word in text for word in ["住宅", "公寓", "别墅", "户型", "房子", "房"]):
             if "别墅" in text:
@@ -414,27 +425,56 @@ class PlannerAgent:
         rooms = []
         room_map = {
             "客厅": 24, "餐厅": 12, "厨房": 9,
-            "主卧": 18, "次卧": 12, "书房": 10,
+            "主卧": 18, "次卧": 12, "卧室": 14, "书房": 10,
             "卫生间": 5, "阳台": 6, "玄关": 4,
             "储物间": 3, "衣帽间": 4, "儿童房": 12,
+            "起居室": 20, "客餐厅": 22,
         }
-        for name, default_area in room_map.items():
-            if name in text:
-                area_match = re.search(rf"{name}.*?(\d+)\s*㎡", text)
-                area = int(area_match.group(1)) if area_match else default_area
-                count = 1
-                if name == "次卧":
-                    if "两次卧" in text or "两个次卧" in text or "2个次卧" in text:
-                        count = 2
-                if name == "卫生间":
-                    if (
-                        "两卫" in text or "双卫" in text or "2卫" in text
-                        or "两个卫生间" in text or "两间卫生间" in text or "2个卫生间" in text
-                    ):
-                        count = 2
-                rooms.append({"room_type": name, "count": count, "target_area_sqm": area, "notes": ""})
+        is_modification = bool(self._MODIFICATION_PATTERN.search(text))
+        # Track matched positions to avoid duplicate matching (e.g. "客餐厅" contains "餐厅")
+        matched_spans: list[tuple[int, int]] = []
+
+        # First pass: match longer/compound names first to avoid partial matches
+        sorted_names = sorted(room_map.keys(), key=len, reverse=True)
+        for name in sorted_names:
+            default_area = room_map[name]
+            start = 0
+            while True:
+                idx = text.find(name, start)
+                if idx == -1:
+                    break
+                # Check if this span overlaps with already matched span
+                end_idx = idx + len(name)
+                overlaps = any(s <= idx < e or s < end_idx <= e for s, e in matched_spans)
+                if not overlaps:
+                    matched_spans.append((idx, end_idx))
+                    area_match = re.search(rf"{name}.*?(\d+)\s*㎡", text)
+                    area = int(area_match.group(1)) if area_match else default_area
+                    count = 1
+                    if name == "次卧":
+                        if "两次卧" in text or "两个次卧" in text or "2个次卧" in text:
+                            count = 2
+                    if name == "卧室":
+                        if "两卧室" in text or "两个卧室" in text or "2个卧室" in text or "双卧室" in text:
+                            count = 2
+                    if name == "卫生间":
+                        if (
+                            "两卫" in text or "双卫" in text or "2卫" in text
+                            or "两个卫生间" in text or "两间卫生间" in text or "2个卫生间" in text
+                        ):
+                            count = 2
+                    rooms.append({"room_type": name, "count": count, "target_area_sqm": area, "notes": ""})
+                start = idx + 1
         if rooms:
-            collected["room_program"] = rooms
+            existing_rooms = collected.get("room_program") or []
+            if is_modification and existing_rooms:
+                # Modification intent: merge with existing, don't replace
+                # Also inject position hints into existing room notes
+                self._inject_position_hints(text, existing_rooms, rooms)
+                collected["room_program"] = self._merge_room_extracts(existing_rooms, rooms)
+            else:
+                # New description: replace room_program
+                collected["room_program"] = rooms
 
         adjacency = []
         if "厨房和餐厅" in text or ("厨房" in text and "餐厅" in text):
@@ -447,6 +487,48 @@ class PlannerAgent:
             adjacency.append({"source": "客厅", "target": "卧室区", "relation": "required", "description": "动静分区"})
         if adjacency:
             collected["adjacency_rules"] = adjacency
+
+    @staticmethod
+    def _merge_room_extracts(existing: list[dict], new_mentions: list[dict]) -> list[dict]:
+        """Merge newly mentioned rooms into existing room_program.
+
+        - If a room type already exists in `existing`, keep the existing entry.
+        - Only add rooms that don't exist yet (user is adding new rooms).
+        """
+        existing_types = {r.get("room_type") for r in existing if isinstance(r, dict)}
+        merged = list(existing)
+        for r in new_mentions:
+            if isinstance(r, dict) and r.get("room_type") not in existing_types:
+                merged.append(r)
+        return merged
+
+    @staticmethod
+    def _inject_position_hints(text: str, existing_rooms: list[dict], mentioned_rooms: list[dict]) -> None:
+        """When user gives a modification with position info, inject it into room notes.
+
+        E.g. "将厨房移到右下角" → kitchen room gets notes="用户要求：右下角"
+        """
+        # Map direction keywords to position labels
+        position_map = {
+            "右下": "右下角", "左下": "左下角", "右上": "右上角", "左上": "左上角",
+            "下方": "下方", "上方": "上方", "左侧": "左侧", "右侧": "右侧",
+            "中间": "中间", "中心": "中心",
+            "南": "南侧", "北": "北侧", "东": "东侧", "西": "西侧",
+        }
+        detected_pos = None
+        for kw, label in position_map.items():
+            if kw in text:
+                detected_pos = label
+                break
+        if not detected_pos:
+            return
+
+        mentioned_types = {r.get("room_type") for r in mentioned_rooms if isinstance(r, dict)}
+        for room in existing_rooms:
+            if not isinstance(room, dict):
+                continue
+            if room.get("room_type") in mentioned_types:
+                room["notes"] = f"用户要求：{detected_pos}" + (f"；{room['notes']}" if room.get("notes") else "")
 
     def _build_questions(self, missing_fields: list[str], collected: dict) -> list[str]:
         """At most 2 short questions per round."""
