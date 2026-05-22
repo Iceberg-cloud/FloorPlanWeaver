@@ -1,5 +1,6 @@
 from urllib.parse import quote
 
+from app.agents.prompts import build_drawer_image_prompt
 from app.schemas.drawer import DrawerDraft, ValidationResult
 from app.schemas.planner import PlannerFinalPlan
 
@@ -12,16 +13,7 @@ class DrawerAgent:
     """
 
     def run(self, plan: PlannerFinalPlan) -> DrawerDraft:
-        room_lines = []
-        for item in plan.space_program:
-            suffix = f"约{item.target_area_sqm}㎡" if item.target_area_sqm else "面积自适应"
-            room_lines.append(f"{item.room_type}x{item.count}（{suffix}）")
-        prompt = (
-            "生成一张现代住宅平面图俯视图，黑白线稿风格，标注中文房间名。"
-            f"户型需求：{'; '.join(room_lines)}。"
-            f"关系约束：{plan.drawing_brief}。"
-            "要求比例协调、走线清晰、墙体与门窗表达明确。"
-        )
+        prompt = build_drawer_image_prompt(plan)
         placeholder = (
             "https://placehold.co/1024x1024/png?text="
             + quote("Image Model Failed - Rule Fallback")

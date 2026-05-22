@@ -1,8 +1,10 @@
+import base64
 import json
 from dataclasses import dataclass
 from urllib import error, request as urllib_request
 
 from app.agents.drawer_agent import DrawerAgent
+from app.agents.prompts import build_drawer_image_prompt
 from app.core.config import settings
 from app.schemas.drawer import DrawerDraft
 from app.schemas.planner import PlannerFinalPlan
@@ -62,21 +64,7 @@ class DrawerService:
             return None, str(exc)
 
     def _build_image_prompt(self, plan: PlannerFinalPlan) -> str:
-        room_specs = []
-        for room in plan.space_program:
-            area_text = f"{room.target_area_sqm}㎡" if room.target_area_sqm else "面积自适应"
-            room_specs.append(f"{room.room_type}x{room.count}({area_text})")
-        adjacency_lines = []
-        for edge in plan.adjacency_graph:
-            adjacency_lines.append(f"{edge.source}->{edge.target}({edge.relation})")
-        return (
-            "请生成真实可读的住宅户型平面图，俯视图，2D architectural floor plan，"
-            "中文房间标注，黑白线稿+浅色功能填充，比例协调，门窗表达清楚。\n"
-            f"房间配置：{'；'.join(room_specs)}。\n"
-            f"空间关系：{'；'.join(adjacency_lines)}。\n"
-            f"设计摘要：{plan.drawing_brief}。\n"
-            "输出单张清晰图片，不要添加水印或无关文本。"
-        )
+        return build_drawer_image_prompt(plan)
 
     def _call_images_api(self, prompt: str) -> dict:
         endpoint = self._resolve_images_endpoint(settings.llm_api_base)
@@ -85,7 +73,7 @@ class DrawerService:
                 "model": settings.drawer_model,
                 "prompt": prompt,
                 "size": "1024x1024",
-                "response_format": "url",
+                "response_format": "b64_json",
             },
             ensure_ascii=False,
         ).encode("utf-8")
@@ -99,7 +87,11 @@ class DrawerService:
             method="POST",
         )
         try:
-            with urllib_request.urlopen(req, timeout=settings.llm_timeout_seconds) as resp:
+            from app.services.llm_client import clamp_llm_timeout
+
+            with urllib_request.urlopen(
+                req, timeout=clamp_llm_timeout(settings.llm_timeout_seconds),
+            ) as resp:
                 raw = resp.read().decode("utf-8")
         except error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
@@ -113,10 +105,10 @@ class DrawerService:
             raise RuntimeError("Image API 返回缺少 data 字段。")
         first = data[0]
         image_url = first.get("url")
-        image_base64 = first.get("b64_json")
+        image_base64 = first.get("b64_json") or first.get("image_base64")
         if not image_url and not image_base64:
             raise RuntimeError("Image API 返回缺少 url/b64_json。")
-        return {
+        payload = {
             "drawing_state": "IMAGE_READY",
             "image_url": image_url,
             "image_base64": image_base64,
@@ -129,6 +121,27 @@ class DrawerService:
                 "notes": [],
             },
         }
+        return self._embed_image_for_ui(payload)
+
+    def _embed_image_for_ui(self, payload: dict) -> dict:
+        """Fetch remote URL into base64 so the browser can display without hotlink/CORS blocks."""
+        if payload.get("image_base64"):
+            return payload
+        url = payload.get("image_url")
+        if not url or not str(url).startswith(("http://", "https://")):
+            return payload
+        try:
+            from app.services.llm_client import clamp_llm_timeout
+
+            req = urllib_request.Request(str(url), method="GET")
+            with urllib_request.urlopen(req, timeout=clamp_llm_timeout(60)) as resp:
+                raw = resp.read()
+            ctype = resp.headers.get_content_type() if hasattr(resp.headers, "get_content_type") else "image/png"
+            payload["image_base64"] = base64.b64encode(raw).decode("ascii")
+            payload["image_mime_type"] = ctype or "image/png"
+        except Exception:
+            pass
+        return payload
 
     def _resolve_images_endpoint(self, api_base: str) -> str:
         normalized = api_base.rstrip("/")
