@@ -1,9 +1,23 @@
+from __future__ import annotations
+
 from app.repositories.session_repo import InMemorySessionRepository
 from app.schemas.chat import AgentRuntimeStatus, ChatResponse, ProgressSnapshot, RuntimeStatus
+from app.schemas.layout import LayoutOutput, SiteOutline
 from app.schemas.planner import PlannerAskForMore, PlannerFinalPlan
 from app.schemas.session import ChatMessage
 from app.services.drawer_service import DrawerService
+from app.services.layout_service import LayoutService
 from app.services.planner_service import PlannerService
+from app.services.requirement_memory import (
+    apply_delta_to_memory,
+    build_regenerate_user_message,
+    build_requirement_progress,
+    merge_snapshot,
+    reconcile_final_plan,
+    snapshot_from_final_plan,
+)
+from app.services.planner_service import ensure_planner_ask
+from app.core.config import settings
 
 
 class Orchestrator:
@@ -12,59 +26,114 @@ class Orchestrator:
         repo: InMemorySessionRepository,
         planner_service: PlannerService,
         drawer_service: DrawerService,
+        layout_service: LayoutService | None = None,
     ) -> None:
         self.repo = repo
         self.planner_service = planner_service
         self.drawer_service = drawer_service
+        self.layout_service = layout_service
 
-    def handle_chat(self, session_id: str, user_message: str) -> ChatResponse:
+    def handle_chat(
+        self,
+        session_id: str,
+        user_message: str,
+        draw_method: str = "auto",
+    ) -> ChatResponse:
         session = self.repo.get(session_id)
+        if draw_method and draw_method != "auto":
+            session.draw_method = draw_method
         session.messages.append(ChatMessage(role="user", content=user_message))
 
+        prior_messages = session.messages[:-1]
+        working_memory = apply_delta_to_memory(
+            session.collected_requirements, user_message,
+            chat_history=prior_messages,
+        )
+
+        force_plan = session.planner_ask_count >= settings.planner_max_ask_rounds
         planner_exec = self.planner_service.generate(
             user_message=user_message,
-            collected_requirements=session.collected_requirements,
+            collected_requirements=working_memory,
+            chat_history=prior_messages,
+            ask_count=session.planner_ask_count,
+            force_finalize=force_plan,
         )
         planner_output = planner_exec.output
 
         if isinstance(planner_output, PlannerAskForMore):
-            session.planner_state = "collecting"
-            session.collected_requirements = planner_output.collected_snapshot
-            session.messages.append(
-                ChatMessage(role="assistant", content="\n".join(planner_output.follow_up_questions))
+            planner_output = ensure_planner_ask(
+                planner_output,
+                working_memory,
+                user_message=user_message,
+                ask_count=session.planner_ask_count,
             )
-            self.repo.save(session)
-            return ChatResponse(
-                status="collecting",
-                planner=planner_output,
-                progress=ProgressSnapshot(
-                    collected_fields=sorted(list(session.collected_requirements.keys())),
-                    missing_fields=planner_output.missing_fields,
-                ),
-                runtime=RuntimeStatus(
-                    planner=AgentRuntimeStatus(
-                        llm_enabled=planner_exec.llm_enabled,
-                        llm_attempted=planner_exec.llm_attempted,
-                        llm_succeeded=planner_exec.llm_succeeded,
-                        fallback_to_rule=planner_exec.fallback_to_rule,
-                        error=planner_exec.error,
+            if isinstance(planner_output, PlannerAskForMore):
+                session.planner_ask_count += 1
+                session.planner_state = "collecting"
+                session.collected_requirements = merge_snapshot(
+                    session.collected_requirements,
+                    planner_output.collected_snapshot,
+                )
+                session.messages.append(
+                    ChatMessage(
+                        role="assistant",
+                        content="\n".join(planner_output.follow_up_questions),
+                    )
+                )
+                self.repo.save(session)
+                return ChatResponse(
+                    status="collecting",
+                    planner=planner_output,
+                    progress=build_requirement_progress(
+                        merge_snapshot(working_memory, planner_output.collected_snapshot),
                     ),
-                    drawer=None,
-                ),
-            )
+                    runtime=RuntimeStatus(
+                        planner=AgentRuntimeStatus(
+                            llm_enabled=planner_exec.llm_enabled,
+                            llm_attempted=planner_exec.llm_attempted,
+                            llm_succeeded=planner_exec.llm_succeeded,
+                            fallback_to_rule=planner_exec.fallback_to_rule,
+                            error=planner_exec.error,
+                        ),
+                        drawer=None,
+                        layout=None,
+                    ),
+                )
 
         assert isinstance(planner_output, PlannerFinalPlan)
-        try:
-            drawer_exec = self.drawer_service.generate(planner_output)
-        except RuntimeError as exc:
+        planner_output = reconcile_final_plan(
+            planner_output,
+            merge_snapshot(session.collected_requirements, working_memory),
+        )
+        method = session.draw_method
+
+        # --- Method A: Layout (vector) ---
+        layout_exec_result = None
+        if method in ("vector", "both"):
+            layout_exec_result = self._generate_layout(session, planner_output)
+
+        # --- Method B: Drawer (multimodal LLM) ---
+        drawer_exec, drawer_error = None, None
+        if method in ("multimodal", "both"):
+            result = self._generate_drawer(planner_output)
+            if result is not None:
+                drawer_exec, drawer_error = result
+
+        has_layout = layout_exec_result is not None
+        has_drawer = drawer_exec is not None
+
+        if not has_layout and not has_drawer:
             session.planner_state = "completed"
             session.latest_plan = planner_output
+            session.collected_requirements = snapshot_from_final_plan(planner_output)
             session.revision_index += 1
             self.repo.save(session)
+            error_msg = drawer_error or "生成失败"
             return ChatResponse(
                 status="draft_failed",
                 planner=planner_output,
                 drawer=None,
+                layout=None,
                 progress=ProgressSnapshot(
                     collected_fields=sorted(list(session.collected_requirements.keys())),
                     missing_fields=[],
@@ -78,33 +147,46 @@ class Orchestrator:
                         error=planner_exec.error,
                     ),
                     drawer=AgentRuntimeStatus(
-                        llm_enabled=True,
-                        llm_attempted=True,
-                        llm_succeeded=False,
-                        fallback_to_rule=False,
-                        error=str(exc),
-                    ),
+                        llm_enabled=True, llm_attempted=True,
+                        llm_succeeded=False, fallback_to_rule=False,
+                        error=error_msg,
+                    ) if method in ("multimodal", "both") else None,
+                    layout=layout_exec_result._as_runtime() if layout_exec_result else None,
                 ),
             )
-        draft = drawer_exec.output
+
         session.planner_state = "completed"
         session.latest_plan = planner_output
-        session.latest_draft = draft
+        if drawer_exec is not None:
+            session.latest_draft = drawer_exec.output
+        if layout_exec_result is not None:
+            session.latest_layout = layout_exec_result.output
         session.revision_index += 1
-        session.collected_requirements = {
-            "building_type": planner_output.project_profile.building_type,
-            "target_area_sqm": planner_output.project_profile.target_area_sqm,
-            "layout_type": planner_output.project_profile.layout_type,
-            "orientation": planner_output.project_profile.orientation,
-            "room_program": [item.model_dump() for item in planner_output.space_program],
-            "adjacency_rules": [item.model_dump() for item in planner_output.adjacency_graph],
-        }
+        session.collected_requirements = snapshot_from_final_plan(planner_output)
         session.messages.append(ChatMessage(role="assistant", content=planner_output.drawing_brief))
         self.repo.save(session)
+
+        layout_runtime = layout_exec_result._as_runtime() if layout_exec_result else None
+        drawer_runtime = None
+        if drawer_exec is not None:
+            drawer_runtime = AgentRuntimeStatus(
+                llm_enabled=drawer_exec.llm_enabled,
+                llm_attempted=drawer_exec.llm_attempted,
+                llm_succeeded=drawer_exec.llm_succeeded,
+                fallback_to_rule=drawer_exec.fallback_to_rule,
+                error=drawer_exec.error,
+            )
+        elif drawer_error:
+            drawer_runtime = AgentRuntimeStatus(
+                llm_enabled=True, llm_attempted=True, llm_succeeded=False,
+                fallback_to_rule=False, error=drawer_error,
+            )
+
         return ChatResponse(
             status="completed",
             planner=planner_output,
-            drawer=draft,
+            drawer=drawer_exec.output if drawer_exec else None,
+            layout=layout_exec_result.output if layout_exec_result else None,
             progress=ProgressSnapshot(
                 collected_fields=sorted(list(session.collected_requirements.keys())),
                 missing_fields=[],
@@ -117,83 +199,144 @@ class Orchestrator:
                     fallback_to_rule=planner_exec.fallback_to_rule,
                     error=planner_exec.error,
                 ),
-                drawer=AgentRuntimeStatus(
-                    llm_enabled=drawer_exec.llm_enabled,
-                    llm_attempted=drawer_exec.llm_attempted,
-                    llm_succeeded=drawer_exec.llm_succeeded,
-                    fallback_to_rule=drawer_exec.fallback_to_rule,
-                    error=drawer_exec.error,
-                ),
+                drawer=drawer_runtime,
+                layout=layout_runtime,
             ),
         )
 
-    def regenerate_plan(self, session_id: str, modification_request: str) -> ChatResponse:
+    def _generate_layout(self, session, plan: PlannerFinalPlan):
+        if self.layout_service is None:
+            return None
+        outline = session.site_outline
+        if outline is None:
+            outline = self._make_default_outline(plan)
+        try:
+            layout_output = self.layout_service.generate(plan, outline)
+        except Exception:
+            return None
+        return _LayoutResult(output=layout_output)
+
+    def _generate_drawer(self, plan: PlannerFinalPlan):
+        if not settings.drawer_use_llm and not settings.drawer_fallback_to_rule:
+            return None
+        try:
+            return self.drawer_service.generate(plan), None
+        except RuntimeError as exc:
+            return None, str(exc)
+
+    def _make_default_outline(self, plan: PlannerFinalPlan) -> SiteOutline:
+        from app.schemas.layout import Point2D
+        area = plan.project_profile.target_area_sqm or 80
+        ratio = 1.4
+        w = (area * ratio) ** 0.5
+        h = w / ratio
+        return SiteOutline(
+            vertices=[
+                Point2D(x=0, y=0), Point2D(x=w, y=0),
+                Point2D(x=w, y=h), Point2D(x=0, y=h),
+            ],
+            entrance_edge=[0, 1],
+            total_area_sqm=area,
+            bounding_box={"width": w, "height": h},
+            unit="meter",
+        )
+
+    def regenerate_plan(
+        self,
+        session_id: str,
+        modification_request: str,
+        draw_method: str = "auto",
+    ) -> ChatResponse:
         session = self.repo.get(session_id)
         merged_request = modification_request
         if session.latest_plan:
-            merged_request = (
-                f"基于既有方案进行修改。已有绘图摘要：{session.latest_plan.drawing_brief}。修改意见：{modification_request}"
+            merged_request = build_regenerate_user_message(
+                session.latest_plan,
+                modification_request,
+                session.collected_requirements,
             )
-        return self.handle_chat(session_id=session_id, user_message=merged_request)
+        return self.handle_chat(
+            session_id=session_id,
+            user_message=merged_request,
+            draw_method=draw_method,
+        )
 
-    def regenerate_draft(self, session_id: str) -> ChatResponse:
+    def regenerate_draft(self, session_id: str, draw_method: str = "auto") -> ChatResponse:
         session = self.repo.get(session_id)
         if session.latest_plan is None:
             raise ValueError("当前会话还没有可用于重绘的最终方案。")
-        try:
-            drawer_exec = self.drawer_service.generate(session.latest_plan)
-        except RuntimeError as exc:
+
+        method = draw_method if draw_method != "auto" else session.draw_method
+
+        layout_exec_result = None
+        if method in ("vector", "both"):
+            layout_exec_result = self._generate_layout(session, session.latest_plan)
+
+        drawer_exec, drawer_error = None, None
+        if method in ("multimodal", "both"):
+            result = self._generate_drawer(session.latest_plan)
+            if result is not None:
+                drawer_exec, drawer_error = result
+
+        if drawer_exec is None and layout_exec_result is None:
             return ChatResponse(
                 status="draft_failed",
                 planner=session.latest_plan,
                 drawer=None,
+                layout=None,
                 progress=ProgressSnapshot(
                     collected_fields=sorted(list(session.collected_requirements.keys())),
                     missing_fields=[],
                 ),
                 runtime=RuntimeStatus(
-                    planner=AgentRuntimeStatus(
-                        llm_enabled=False,
-                        llm_attempted=False,
-                        llm_succeeded=False,
-                        fallback_to_rule=False,
-                        error=None,
-                    ),
-                    drawer=AgentRuntimeStatus(
-                        llm_enabled=True,
-                        llm_attempted=True,
-                        llm_succeeded=False,
-                        fallback_to_rule=False,
-                        error=str(exc),
-                    ),
+                    planner=AgentRuntimeStatus(llm_enabled=False, llm_attempted=False,
+                                               llm_succeeded=False, fallback_to_rule=False),
+                    drawer=AgentRuntimeStatus(llm_enabled=True, llm_attempted=True,
+                                              llm_succeeded=False, fallback_to_rule=False,
+                                              error=drawer_error),
+                    layout=None,
                 ),
             )
-        draft = drawer_exec.output
-        session.latest_draft = draft
+
+        if drawer_exec:
+            session.latest_draft = drawer_exec.output
+        if layout_exec_result:
+            session.latest_layout = layout_exec_result.output
         session.revision_index += 1
         self.repo.save(session)
         return ChatResponse(
             status="completed",
             planner=session.latest_plan,
-            drawer=draft,
+            drawer=drawer_exec.output if drawer_exec else session.latest_draft,
+            layout=layout_exec_result.output if layout_exec_result else session.latest_layout,
             progress=ProgressSnapshot(
                 collected_fields=sorted(list(session.collected_requirements.keys())),
                 missing_fields=[],
             ),
             runtime=RuntimeStatus(
-                planner=AgentRuntimeStatus(
-                    llm_enabled=False,
-                    llm_attempted=False,
-                    llm_succeeded=False,
-                    fallback_to_rule=False,
-                    error=None,
-                ),
+                planner=AgentRuntimeStatus(llm_enabled=False, llm_attempted=False,
+                                           llm_succeeded=False, fallback_to_rule=False),
                 drawer=AgentRuntimeStatus(
-                    llm_enabled=drawer_exec.llm_enabled,
-                    llm_attempted=drawer_exec.llm_attempted,
-                    llm_succeeded=drawer_exec.llm_succeeded,
-                    fallback_to_rule=drawer_exec.fallback_to_rule,
-                    error=drawer_exec.error,
-                ),
+                    llm_enabled=drawer_exec.llm_enabled if drawer_exec else False,
+                    llm_attempted=drawer_exec.llm_attempted if drawer_exec else True,
+                    llm_succeeded=drawer_exec.llm_succeeded if drawer_exec else False,
+                    fallback_to_rule=drawer_exec.fallback_to_rule if drawer_exec else False,
+                    error=drawer_exec.error if drawer_exec else drawer_error,
+                ) if method in ("multimodal", "both") else None,
+                layout=layout_exec_result._as_runtime() if layout_exec_result else None,
             ),
+        )
+
+
+class _LayoutResult:
+    def __init__(self, output: LayoutOutput):
+        self.output = output
+
+    def _as_runtime(self) -> AgentRuntimeStatus:
+        return AgentRuntimeStatus(
+            llm_enabled=False,
+            llm_attempted=False,
+            llm_succeeded=False,
+            fallback_to_rule=True,
+            error=None,
         )

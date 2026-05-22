@@ -1,9 +1,45 @@
 __pycache__/
 *.pyc
+*.pyo
 .DS_Store
+Thumbs.db
 
-backend/.venv/
-frontend/node_modules/
-frontend/.next/
+# Python
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+coverage/
+.turbo/
+
+# Environment
+.env
 backend/.env
 frontend/.env.local
+frontend/.env*.local
+!.env.example
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Logs
+*.log
+.shutdown_requested
+
+# Temp output
+backend/scripts/*.png
+backend/scripts/*.svg
+backend/data/*.db
+
+# Session persistence (P0)
+!backend/data/.gitkeep

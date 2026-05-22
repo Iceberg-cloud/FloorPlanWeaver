@@ -1,7 +1,8 @@
 from pydantic import BaseModel, Field
 
 from app.schemas.drawer import DrawerDraft
-from app.schemas.planner import PlannerAskForMore, PlannerFinalPlan
+from app.schemas.layout import LayoutOutput
+from app.schemas.planner import PlannerOutput
 
 
 class CreateSessionResponse(BaseModel):
@@ -11,15 +12,18 @@ class CreateSessionResponse(BaseModel):
 class ChatRequest(BaseModel):
     session_id: str
     user_message: str
+    draw_method: str = "auto"  # vector | multimodal | both | auto
 
 
 class RegeneratePlanRequest(BaseModel):
     session_id: str
     modification_request: str
+    draw_method: str = "auto"
 
 
 class RegenerateDraftRequest(BaseModel):
     session_id: str
+    draw_method: str = "auto"
 
 
 class ProgressSnapshot(BaseModel):
@@ -38,11 +42,23 @@ class AgentRuntimeStatus(BaseModel):
 class RuntimeStatus(BaseModel):
     planner: AgentRuntimeStatus
     drawer: AgentRuntimeStatus | None = None
+    layout: AgentRuntimeStatus | None = None
 
 
 class ChatResponse(BaseModel):
     status: str
-    planner: PlannerAskForMore | PlannerFinalPlan
+    planner: PlannerOutput
     drawer: DrawerDraft | None = None
+    layout: LayoutOutput | None = None
     progress: ProgressSnapshot
     runtime: RuntimeStatus
+
+
+class ShutdownRequest(BaseModel):
+    session_id: str | None = None
+
+
+class ShutdownResponse(BaseModel):
+    status: str
+    message: str = ""
+    session_cleared: bool = False

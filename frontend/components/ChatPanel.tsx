@@ -1,53 +1,198 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useEffect, useState } from "react";
+import { Icon } from "./Icon";
+import { ThinkingPipeline } from "./ThinkingPipeline";
+import type { PipelineStage } from "../lib/pipelineStages";
 
 type Message = { role: "user" | "assistant"; content: string };
+
+const TEMPLATES = [
+  {
+    label: "三口之家",
+    icon: "home" as const,
+    prompt: "三室两厅住宅，120㎡，南向，三口之家居住，需要主卧、两个次卧、客厅、餐厅、厨房、两个卫生间、阳台",
+  },
+  {
+    label: "两代同住",
+    icon: "layout" as const,
+    prompt: "四室两厅住宅，140㎡，南向，三代同堂，需要主卧套间、两个次卧、一个书房兼客房、客厅、餐厅、厨房、两个卫生间、大阳台，动静分离",
+  },
+  {
+    label: "一人公寓",
+    icon: "grid" as const,
+    prompt: "一室一厅公寓，60㎡，南向采光，单身居住，需要卧室、客餐厅一体、开放式厨房、卫生间、阳台，紧凑实用",
+  },
+  {
+    label: "两居刚需",
+    icon: "clipboard" as const,
+    prompt: "两室一厅住宅，80㎡，南向，年轻夫妻居住，需要主卧、次卧可做书房、客厅、厨房、一个卫生间、阳台",
+  },
+  {
+    label: "改善大平层",
+    icon: "home" as const,
+    prompt: "四室两厅大平层，160㎡，南北通透，改善型住宅，需要主卧套间带独卫和衣帽间、两个次卧、书房、大客厅、餐厅、中西厨、两个卫生间、大阳台、玄关储物",
+  },
+];
 
 export function ChatPanel({
   messages,
   loading,
-  onSend
+  pipelineStages = [],
+  pipelineActiveIndex = 0,
+  onSend,
 }: {
   messages: Message[];
   loading: boolean;
+  pipelineStages?: PipelineStage[];
+  pipelineActiveIndex?: number;
   onSend: (text: string) => Promise<void>;
 }) {
   const [input, setInput] = useState("");
+  const [showTemplates, setShowTemplates] = useState(true);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages, loading]);
+
+  // Hide templates after first user message
+  useEffect(() => {
+    if (messages.some((m) => m.role === "user")) {
+      setShowTemplates(false);
+    }
+  }, [messages]);
 
   return (
-    <div className="flex h-full flex-col rounded-lg border bg-white p-4">
-      <h2 className="text-lg font-semibold">需求对话</h2>
-      <div className="mt-3 flex-1 space-y-3 overflow-y-auto">
-        {messages.map((message, idx) => (
-          <div
-            key={`${message.role}-${idx}`}
-            className={`rounded-md px-3 py-2 text-sm ${
-              message.role === "user" ? "bg-slate-900 text-white" : "bg-slate-100 text-slate-900"
-            }`}
+    <div className="fpw-card flex h-full flex-col overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center gap-2 border-b border-slate-100 px-4 py-3">
+        <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-indigo-50">
+          <Icon name="chat" size={14} className="text-indigo-600" />
+        </div>
+        <h2 className="text-sm font-semibold text-slate-800">需求对话</h2>
+        {messages.length > 0 && (
+          <button
+            className="ml-auto text-[10px] text-indigo-500 hover:text-indigo-700 transition-colors"
+            onClick={() => setShowTemplates(!showTemplates)}
           >
-            {message.content}
+            {showTemplates ? "收起模板" : "快捷模板"}
+          </button>
+        )}
+      </div>
+
+      {/* Template Quick Buttons */}
+      {showTemplates && (
+        <div className="border-b border-slate-100 px-4 py-2">
+          <div className="flex items-center gap-1.5 mb-1.5">
+            <Icon name="sparkles" size={11} className="text-amber-500" />
+            <span className="text-[10px] font-semibold text-slate-500">快捷模板</span>
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {TEMPLATES.map((t) => (
+              <button
+                key={t.label}
+                className="flex items-center gap-1 rounded-lg bg-gradient-to-r from-indigo-50 to-violet-50 px-2.5 py-1.5 text-[11px] font-medium text-indigo-700 hover:from-indigo-100 hover:to-violet-100 transition-all border border-indigo-100"
+                disabled={loading}
+                onClick={async () => {
+                  setShowTemplates(false);
+                  await onSend(t.prompt);
+                }}
+              >
+                <Icon name={t.icon} size={10} className="text-indigo-500" />
+                {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Messages */}
+      <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-3">
+        {messages.length === 0 && !loading && (
+          <div className="flex flex-col items-center justify-center py-6 text-center">
+            <div className="flex h-12 w-12 items-center justify-center rounded-full bg-slate-100">
+              <Icon name="home" size={22} className="text-slate-400" />
+            </div>
+            <p className="mt-3 text-sm text-slate-400">点击上方模板快速开始</p>
+            <p className="mt-1 text-xs text-slate-300">或输入你的户型需求</p>
+          </div>
+        )}
+        {messages.map((message, idx) => (
+          <div key={`${message.role}-${idx}`} className="flex gap-2">
+            {message.role === "assistant" && (
+              <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-50 mt-1">
+                <Icon name="bot" size={12} className="text-indigo-500" />
+              </div>
+            )}
+            <div
+              className={
+                message.role === "user"
+                  ? "fpw-bubble-user ml-auto max-w-[85%]"
+                  : "fpw-bubble-assistant max-w-[85%]"
+              }
+            >
+              {message.content}
+            </div>
+            {message.role === "user" && (
+              <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-white border border-slate-200 mt-1">
+                <Icon name="user" size={12} className="text-slate-500" />
+              </div>
+            )}
           </div>
         ))}
+
+        {loading && pipelineStages.length > 0 && (
+          <ThinkingPipeline stages={pipelineStages} activeIndex={pipelineActiveIndex} />
+        )}
+        {loading && pipelineStages.length === 0 && (
+          <div className="flex gap-2">
+            <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-50 mt-1 ai-thinking-glow">
+              <Icon name="brain" size={12} className="text-indigo-500 ai-thinking-pulse" />
+            </div>
+            <div className="ai-thinking-indicator">
+              <div className="ai-thinking-dots">
+                <span />
+                <span />
+                <span />
+              </div>
+              <span className="text-xs font-medium text-indigo-600">AI 正在思考...</span>
+            </div>
+          </div>
+        )}
       </div>
-      <div className="mt-3 flex gap-2">
-        <input
-          className="flex-1 rounded-md border px-3 py-2 text-sm outline-none focus:border-slate-500"
-          placeholder="输入你的户型需求..."
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-        />
-        <button
-          className="rounded-md bg-slate-900 px-4 py-2 text-sm text-white disabled:opacity-60"
-          disabled={loading || !input.trim()}
-          onClick={async () => {
-            const content = input.trim();
-            setInput("");
-            await onSend(content);
-          }}
-        >
-          发送
-        </button>
+
+      {/* Input */}
+      <div className="border-t border-slate-100 px-4 py-3">
+        <div className="flex gap-2">
+          <input
+            className="flex-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm outline-none transition-colors focus:border-indigo-400 focus:bg-white"
+            placeholder="输入你的户型需求..."
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey && input.trim() && !loading) {
+                const content = input.trim();
+                setInput("");
+                void onSend(content);
+              }
+            }}
+          />
+          <button
+            className="fpw-icon-btn bg-indigo-600 text-white hover:bg-indigo-700"
+            disabled={loading || !input.trim()}
+            onClick={async () => {
+              const content = input.trim();
+              setInput("");
+              await onSend(content);
+            }}
+          >
+            <Icon name="send" size={14} />
+            <span className="hidden sm:inline">发送</span>
+          </button>
+        </div>
       </div>
     </div>
   );

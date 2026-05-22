@@ -1,11 +1,22 @@
 import json
 import re
+import socket
 import time
 from typing import Any, Protocol
 from urllib import error, request as urllib_request
 
 from app.core.config import settings
 from app.schemas.llm import LLMJsonRequest, LLMJsonResponse
+
+
+def clamp_llm_timeout(seconds: int | float | None) -> int:
+    """Cap per-request HTTP wait; Windows urllib only accepts a single timeout value."""
+    cap = max(10, settings.llm_hard_timeout_seconds)
+    try:
+        value = int(seconds or cap)
+    except (TypeError, ValueError):
+        value = cap
+    return max(10, min(value, cap))
 
 
 class ProviderAdapter(Protocol):
@@ -78,15 +89,26 @@ class HttpCompatibleProviderAdapter:
             method="POST",
         )
 
+        http_timeout = clamp_llm_timeout(request.timeout_seconds)
         try:
-            with urllib_request.urlopen(req, timeout=request.timeout_seconds) as resp:
+            with urllib_request.urlopen(req, timeout=http_timeout) as resp:
                 response_raw = resp.read().decode("utf-8")
         except error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="ignore")
             raise RuntimeError(
                 f"LLM HTTP 错误: status={exc.code}, body={error_body}"
             ) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise TimeoutError(
+                f"LLM 请求超时（上限 {http_timeout}s，硬限制 {settings.llm_hard_timeout_seconds}s）。"
+                "可改用更快模型或检查网络。"
+            ) from exc
         except error.URLError as exc:
+            reason = str(exc.reason)
+            if "timed out" in reason.lower() or "timeout" in reason.lower():
+                raise TimeoutError(
+                    f"LLM 请求超时（上限 {http_timeout}s）。请检查网络或代理。"
+                ) from exc
             raise RuntimeError(f"LLM 网络错误: {exc.reason}") from exc
 
         response_data = json.loads(response_raw)
@@ -104,7 +126,6 @@ class HttpCompatibleProviderAdapter:
         if req.metadata:
             payload["metadata"] = req.metadata
 
-        # OpenAI 兼容格式：优先使用 json_schema，其次 json_object。
         if req.json_schema:
             payload["response_format"] = {
                 "type": "json_schema",
@@ -169,34 +190,42 @@ class LLMClient:
         messages: list[dict[str, str]],
         model: str,
         json_schema: dict[str, Any] | None = None,
-        timeout_seconds: int = 45,
+        timeout_seconds: int = 120,
         max_retries: int = 2,
         temperature: float = 0.2,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        req = LLMJsonRequest(
-            system_prompt=system_prompt,
-            messages=messages,
-            model=model,
-            json_schema=json_schema,
-            timeout_seconds=timeout_seconds,
-            max_retries=max_retries,
-            temperature=temperature,
-            metadata=metadata or {},
-        )
+        hard_cap = settings.llm_hard_timeout_seconds
+        per_call_timeout = clamp_llm_timeout(timeout_seconds)
+        deadline = time.time() + hard_cap
+
         last_error: Exception | None = None
         for attempt in range(max_retries + 1):
+            remaining = deadline - time.time()
+            if remaining < 2:
+                raise TimeoutError(
+                    f"LLM 总耗时已超过硬限制 {hard_cap}s（含重试）。"
+                )
+
+            attempt_timeout = clamp_llm_timeout(min(per_call_timeout, int(remaining)))
+            req = LLMJsonRequest(
+                system_prompt=system_prompt,
+                messages=messages,
+                model=model,
+                json_schema=json_schema,
+                timeout_seconds=attempt_timeout,
+                max_retries=max_retries,
+                temperature=temperature,
+                metadata=metadata or {},
+            )
             try:
-                started_at = time.time()
                 response = self.adapter.generate(req)
-                elapsed = time.time() - started_at
-                if elapsed > timeout_seconds:
-                    raise TimeoutError("LLM 请求超时。")
                 return response.data
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 if attempt == max_retries:
                     break
-                time.sleep(0.4 * (attempt + 1))
+                time.sleep(min(0.4 * (attempt + 1), max(0.0, deadline - time.time() - 1)))
+
         assert last_error is not None
         raise RuntimeError(f"LLM 调用失败: {last_error}") from last_error
