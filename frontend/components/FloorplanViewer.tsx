@@ -4,7 +4,12 @@ import { useEffect, useMemo, useState } from "react";
 import { Icon } from "./Icon";
 import type { DrawMethod } from "./ActionBar";
 import type { DrawerDraft, LayoutOutput, LayoutRoom, SiteOutline } from "../lib/types";
-import { normalizePolygonRing, polygonLabelCenter } from "../lib/polygonRender";
+import {
+  labelFontSizesFromBbox,
+  normalizePolygonRing,
+  polygonLabelCenter,
+  roomBbox,
+} from "../lib/polygonRender";
 
 type Tab = "layout" | "drawer";
 
@@ -316,50 +321,78 @@ function RoomShape({ room, fill, stroke }: { room: LayoutRoom; fill: string; str
   const pts = normalizePolygonRing(room.pts ?? []);
   if (pts.length < 3) return null;
 
+  const clipId = `room-clip-${room.room_id || room.name}`.replace(/[^\w-]/g, "_");
   const { x: cx, y: cy } = polygonLabelCenter(pts);
   const isPoly = room.shape_kind === "polygon" || pts.length > 4;
   const area = room.area_sqm ?? 0;
+  const { nameFs, areaFs, showArea, strokeW } = labelFontSizesFromBbox(pts);
+  const bb = roomBbox(pts);
+  const bbW = bb.maxX - bb.minX;
+  const bbH = bb.maxY - bb.minY;
 
-  // Adaptive font sizes based on room area
-  let nameFs: number;
-  let areaFs: number;
-  if (area >= 14) {
-    nameFs = 0.40; areaFs = 0.28;
-  } else if (area >= 8) {
-    nameFs = 0.34; areaFs = 0.24;
-  } else if (area >= 4) {
-    nameFs = 0.28; areaFs = 0.19;
-  } else {
-    nameFs = 0.22; areaFs = 0.15;
-  }
+  // Truncate long room names if they won't fit
+  const maxChars = Math.max(1, Math.floor(bbW / nameFs));
+  const displayName = room.name.length > maxChars + 1
+    ? room.name.slice(0, maxChars) + "…"
+    : room.name;
+
+  const labelProps = {
+    textAnchor: "middle" as const,
+    dominantBaseline: "central" as const,
+    fill: "#1e293b",
+    fontWeight: 600,
+    style: { pointerEvents: "none" as const },
+  };
+  const pointsStr = pts.map((p) => `${p.x},${p.y}`).join(" ");
 
   return (
     <g>
+      <defs>
+        <clipPath id={clipId}>
+          <polygon points={pointsStr} />
+        </clipPath>
+      </defs>
       <polygon
-        points={pts.map((p) => `${p.x},${p.y}`).join(" ")}
+        points={pointsStr}
         fill={fill}
         stroke={stroke}
-        strokeWidth="0.06"
+        strokeWidth={strokeW}
         strokeLinejoin="miter"
         strokeLinecap="square"
         fillRule="evenodd"
+        paintOrder="stroke fill"
         vectorEffect="non-scaling-stroke"
         className={isPoly ? "fpw-room-poly" : "fpw-room-rect"}
       />
-      {area < 3 ? (
-        <text x={cx} y={cy + nameFs * 0.35} textAnchor="middle" fontSize={nameFs} fill="#1e293b" fontWeight="600">
-          {room.name}
-        </text>
-      ) : (
-        <>
-          <text x={cx} y={cy - nameFs * 0.25} textAnchor="middle" fontSize={nameFs} fill="#1e293b" fontWeight="600">
-            {room.name}
+      <g clipPath={`url(#${clipId})`}>
+        {showArea && nameFs >= 0.2 ? (
+          <>
+            <text x={cx} y={cy - nameFs * 0.5} fontSize={nameFs} {...labelProps}>
+              {displayName}
+            </text>
+            <text
+              x={cx}
+              y={cy + nameFs * 0.42}
+              fontSize={areaFs}
+              textAnchor="middle"
+              dominantBaseline="central"
+              fill="#475569"
+              style={{ pointerEvents: "none" }}
+            >
+              {area > 0 ? `${area.toFixed(1)}㎡` : ""}
+            </text>
+          </>
+        ) : (
+          <text
+            x={Math.min(Math.max(cx, bb.minX + nameFs * 0.6), bb.maxX - nameFs * 0.6)}
+            y={Math.min(Math.max(cy, bb.minY + nameFs * 0.5), bb.maxY - nameFs * 0.5)}
+            fontSize={nameFs}
+            {...labelProps}
+          >
+            {displayName}
           </text>
-          <text x={cx} y={cy + areaFs * 0.75} textAnchor="middle" fontSize={areaFs} fill="#64748b">
-            {area.toFixed(1)}㎡
-          </text>
-        </>
-      )}
+        )}
+      </g>
     </g>
   );
 }

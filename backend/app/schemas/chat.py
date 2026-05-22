@@ -52,6 +52,8 @@ class ChatResponse(BaseModel):
     layout: LayoutOutput | None = None
     progress: ProgressSnapshot
     runtime: RuntimeStatus
+    notices: list[str] = Field(default_factory=list)
+    has_site_outline: bool = False
 
 
 class ShutdownRequest(BaseModel):

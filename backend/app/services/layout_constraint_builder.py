@@ -12,6 +12,14 @@ from app.services.layout_compiler import (
     _unique_room_label,
 )
 from app.services.layout_geometry import bbox_of_polygon
+from app.services.room_layout_conventions import (
+    merge_avoid_lists,
+    merge_near_lists,
+    min_target_area,
+    prefer_edge_for,
+    typical_aspect_bounds,
+    zone_for,
+)
 from app.services.semantic_validator import reconcile_semantic_with_program
 
 # User-specified placement priority (lower = earlier)
@@ -20,9 +28,9 @@ _PRIORITY_ORDER: list[str] = [
     "卫生间", "主卫", "客卫", "洗手间", "厕所",
     "主卧",
     "次卧", "卧室", "儿童房",
+    "餐厅",
     "厨房",
     "书房",
-    "餐厅",
     "客厅", "起居室", "客餐厅",
 ]
 
@@ -44,7 +52,7 @@ def _room_rules(room_type: str) -> dict:
     if rt in ("主卧", "次卧", "卧室", "儿童房"):
         return dict(must_touch_outline=True, must_be_rectangle=True, allow_non_rect=False, area_tolerance=0.25)
     if rt == "厨房":
-        return dict(must_touch_outline=False, must_be_rectangle=True, allow_non_rect=True, area_tolerance=0.3)
+        return dict(must_touch_outline=True, must_be_rectangle=True, allow_non_rect=True, area_tolerance=0.25)
     if rt == "书房":
         return dict(must_touch_outline=False, must_be_rectangle=True, allow_non_rect=True, area_tolerance=0.3)
     if rt in ("餐厅", "客厅", "起居室", "客餐厅"):
@@ -93,32 +101,73 @@ def build_constraint_plan(
             adj_pref.setdefault(intent.a, []).append(intent.b)
             adj_pref.setdefault(intent.b, []).append(intent.a)
 
+    for edge in plan.adjacency_graph:
+        src, tgt = edge.source, edge.target
+        if not src or not tgt:
+            continue
+        if edge.relation in ("required", "must"):
+            if tgt not in adj_req.get(src, []):
+                adj_req.setdefault(src, []).append(tgt)
+            if src not in adj_req.get(tgt, []):
+                adj_req.setdefault(tgt, []).append(src)
+        elif edge.relation in ("preferred", "prefer"):
+            if tgt not in adj_pref.get(src, []):
+                adj_pref.setdefault(src, []).append(tgt)
+            if src not in adj_pref.get(tgt, []):
+                adj_pref.setdefault(tgt, []).append(src)
+
     rooms: list[RoomPlacementConstraint] = []
     for entry in list(entries.fixed) + list(entries.flexible):
         rt = entry.room_type or entry.name
         rules = _room_rules(rt)
-        zone = llm.room_zone.get(rt, entry.zone if entry.zone != "flexible" else "center")
+        zone = zone_for(
+            rt,
+            llm.room_zone.get(rt, entry.zone if entry.zone != "flexible" else "center"),
+        )
         pos_hint = entry.corner_hint or hint_map.get(rt, zone)
+        edge = prefer_edge_for(rt, hint_map.get(rt, "") or orient_map.get(rt, ""))
+        target_sqm = max(min_target_area(rt), float(entry.target_area or 8))
+        asp_min, asp_max = typical_aspect_bounds(rt)
+        near = merge_near_lists(
+            list(near_map.get(rt, entry.near_rooms or [])),
+            rt,
+        )
+        if rt == "厨房" and "餐厅" not in near:
+            near.append("餐厅")
+        if rt == "餐厅" and "厨房" not in near:
+            near.append("厨房")
+        avoid = merge_avoid_lists(
+            list(avoid_map.get(rt, entry.avoid_rooms or [])),
+            rt,
+        )
+        adj_pref_list = list(adj_pref.get(entry.name, adj_pref.get(rt, [])))
+        for other in merge_near_lists([], rt):
+            if other not in adj_pref_list:
+                adj_pref_list.append(other)
         hx, hy = xy_map.get(rt, (0.5, 0.5))
         rooms.append(
             RoomPlacementConstraint(
                 name=entry.name,
                 room_type=rt,
-                target_area_sqm=max(3.0, entry.target_area),
+                target_area_sqm=target_sqm,
                 area_tolerance=rules["area_tolerance"],
                 zone_preference=zone,
-                preferred_orientation=orient_map.get(rt, zone if zone in ("south", "north", "east", "west") else ""),
+                preferred_orientation=edge or orient_map.get(
+                    rt, zone if zone in ("south", "north", "east", "west") else "",
+                ),
                 preferred_position_hint=pos_hint,
                 position_hint_x=hx,
                 position_hint_y=hy,
                 must_touch_outline=rules["must_touch_outline"],
                 must_be_rectangle=rules["must_be_rectangle"],
+                aspect_min=asp_min,
+                aspect_max=asp_max,
                 allow_non_rect=rules["allow_non_rect"],
                 priority=_priority_index(rt),
-                near_rooms=near_map.get(rt, entry.near_rooms or []),
-                avoid_rooms=avoid_map.get(rt, entry.avoid_rooms or []),
+                near_rooms=near,
+                avoid_rooms=avoid,
                 adjacency_required=adj_req.get(entry.name, adj_req.get(rt, [])),
-                adjacency_preferred=adj_pref.get(entry.name, adj_pref.get(rt, [])),
+                adjacency_preferred=adj_pref_list,
                 index=entry.index,
             )
         )
@@ -133,6 +182,22 @@ def build_constraint_plan(
         adjacency_prefer=list(llm.adjacency_prefer),
         adjacency_avoid=getattr(llm, "adjacency_avoid", []) or [],
     )
+
+
+def constraint_counts_match_program(
+    constraint_plan: LayoutConstraintPlan,
+    plan: PlannerFinalPlan,
+) -> bool:
+    """True when each space_program room type/count matches constraint rooms."""
+    from collections import Counter
+
+    prog: Counter[str] = Counter()
+    for item in plan.space_program:
+        prog[item.room_type] += max(1, item.count)
+    cons: Counter[str] = Counter()
+    for r in constraint_plan.rooms:
+        cons[r.room_type] += 1
+    return prog == cons
 
 
 def expand_program_labels(plan: PlannerFinalPlan) -> list[tuple[str, str, float, int]]:

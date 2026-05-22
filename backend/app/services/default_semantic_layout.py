@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from app.schemas.planner import PlannerFinalPlan
-from app.schemas.semantic_layout import LayoutBand, RoomPlacement, SemanticLayoutPlan
+from app.schemas.semantic_layout import AdjacencyIntent, LayoutBand, RoomPlacement, SemanticLayoutPlan
+from app.services.room_layout_conventions import (
+    build_default_bands,
+    merge_avoid_lists,
+    merge_near_lists,
+    prefer_edge_for,
+    zone_for,
+)
 
 _PUBLIC = frozenset({"客厅", "餐厅", "厨房", "阳台", "玄关", "起居", "客餐厅"})
 _PRIVATE = frozenset({"主卧", "次卧", "书房", "卧室", "儿童房"})
@@ -75,9 +82,9 @@ def _extract_prefer_edge(notes: str, room_type: str) -> str:
     Converts Chinese position hints to edge labels used by grid compiler.
     """
     # Default edge preferences by room type
-    defaults = {"客厅": "south", "阳台": "south"}
+    defaults = prefer_edge_for(room_type) or ""
     if not notes:
-        return defaults.get(room_type, "")
+        return defaults
 
     pos_map = {
         "右下": "south", "左下": "south", "下": "south", "南侧": "south", "南": "south",
@@ -89,7 +96,7 @@ def _extract_prefer_edge(notes: str, room_type: str) -> str:
     for kw, edge in pos_map.items():
         if kw in notes:
             return edge
-    return defaults.get(room_type, "")
+    return defaults or prefer_edge_for(room_type, "")
 
 
 def build_default_semantic_plan(plan: PlannerFinalPlan) -> SemanticLayoutPlan:
@@ -100,10 +107,12 @@ def build_default_semantic_plan(plan: PlannerFinalPlan) -> SemanticLayoutPlan:
 
     for item in plan.space_program:
         cluster = _cluster_for(item.room_type)
-        zone = _zone_for(item.room_type, cluster)
+        zone = zone_for(item.room_type, _zone_for(item.room_type, cluster))
         size = "large" if (item.target_area_sqm or 0) >= 14 else "medium" if (item.target_area_sqm or 0) >= 8 else "small"
-        # Extract position hint from notes (e.g. "用户要求：右下角")
         prefer_edge = _extract_prefer_edge(item.notes or "", item.room_type)
+        prefer_edge = prefer_edge_for(item.room_type, prefer_edge)
+        near = merge_near_lists([], item.room_type)
+        avoid = merge_avoid_lists([], item.room_type)
         for idx in range(max(1, item.count)):
             name = item.room_type if item.count == 1 else f"{item.room_type}{idx + 1}"
             placements.append(
@@ -113,6 +122,8 @@ def build_default_semantic_plan(plan: PlannerFinalPlan) -> SemanticLayoutPlan:
                     size=size,  # type: ignore[arg-type]
                     cluster=cluster,  # type: ignore[arg-type]
                     prefer_edge=prefer_edge,
+                    near=near,
+                    avoid=avoid,
                     index=idx + 1,
                 )
             )
@@ -123,30 +134,22 @@ def build_default_semantic_plan(plan: PlannerFinalPlan) -> SemanticLayoutPlan:
             elif cluster == "service" and item.room_type not in service_order:
                 service_order.append(item.room_type)
 
-    # Strip bands: ① 卫/阳台/卧 ② 厨 ③ 客餐厅由 flexible 阶段填充
-    bands: list[LayoutBand] = []
-    row1: list[str] = []
-    for key in ("阳台", "卫生间", "主卧", "次卧", "卧室", "儿童房"):
-        for src in (service_order, private_order):
-            if key in src and key not in row1:
-                row1.append(key)
-    for r in service_order + private_order:
-        if r not in row1 and r not in ("厨房", "客厅", "餐厅", "起居室", "客餐厅"):
-            row1.append(r)
-    if row1:
-        bands.append(LayoutBand(order=row1))
-
-    row2: list[str] = []
-    if "厨房" in public_order or "厨房" in private_order or "厨房" in service_order:
-        row2.append("厨房")
-    for r in public_order:
-        if r == "厨房" and r not in row2:
-            row2.append(r)
-    if row2:
-        bands.append(LayoutBand(order=row2))
+    # Strip bands: 北卧区 → 厨卫服务带 → 南阳台；客厅/餐厅由 flexible 填充在南侧
+    band_rows = build_default_bands(public_order, private_order, service_order)
+    bands = [LayoutBand(order=row) for row in band_rows if row]
 
     if not bands and placements:
         bands = [LayoutBand(order=[p.room_type for p in placements])]
+
+    adjacency_intent: list[AdjacencyIntent] = []
+    for a, b, strength in (
+        ("厨房", "餐厅", "must"),
+        ("餐厅", "客厅", "prefer"),
+        ("客厅", "阳台", "prefer"),
+        ("主卧", "卫生间", "prefer"),
+    ):
+        if any(p.room_type == a for p in placements) and any(p.room_type == b for p in placements):
+            adjacency_intent.append(AdjacencyIntent(a=a, b=b, strength=strength))
 
     _apply_default_position_hints(placements, bands)
 
@@ -164,4 +167,5 @@ def build_default_semantic_plan(plan: PlannerFinalPlan) -> SemanticLayoutPlan:
         entrance_room=entrance,
         placements=placements,
         bands=bands,
+        adjacency_intent=adjacency_intent,
     )

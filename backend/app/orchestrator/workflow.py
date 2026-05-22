@@ -9,10 +9,13 @@ from app.services.drawer_service import DrawerService
 from app.services.layout_service import LayoutService
 from app.services.planner_service import PlannerService
 from app.services.requirement_memory import (
+    align_memory_with_outline,
     apply_delta_to_memory,
     build_regenerate_user_message,
     build_requirement_progress,
+    effective_outline_area_sqm,
     merge_snapshot,
+    outline_reminder_notices,
     reconcile_final_plan,
     snapshot_from_final_plan,
 )
@@ -33,6 +36,21 @@ class Orchestrator:
         self.drawer_service = drawer_service
         self.layout_service = layout_service
 
+    @staticmethod
+    def _has_site_outline(session) -> bool:
+        o = session.site_outline
+        return o is not None and len(o.vertices) >= 3
+
+    @staticmethod
+    def _build_notices(session, extra: list[str] | None = None) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in outline_reminder_notices(Orchestrator._has_site_outline(session)) + (extra or []):
+            if item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
+
     def handle_chat(
         self,
         session_id: str,
@@ -49,6 +67,10 @@ class Orchestrator:
             session.collected_requirements, user_message,
             chat_history=prior_messages,
         )
+        working_memory, area_notices = align_memory_with_outline(
+            working_memory, session.site_outline,
+        )
+        response_notices = self._build_notices(session, area_notices)
 
         force_plan = session.planner_ask_count >= settings.planner_max_ask_rounds
         planner_exec = self.planner_service.generate(
@@ -70,10 +92,14 @@ class Orchestrator:
             if isinstance(planner_output, PlannerAskForMore):
                 session.planner_ask_count += 1
                 session.planner_state = "collecting"
-                session.collected_requirements = merge_snapshot(
+                merged_collected = merge_snapshot(
                     session.collected_requirements,
                     planner_output.collected_snapshot,
                 )
+                merged_collected, _ = align_memory_with_outline(
+                    merged_collected, session.site_outline,
+                )
+                session.collected_requirements = merged_collected
                 session.messages.append(
                     ChatMessage(
                         role="assistant",
@@ -84,9 +110,7 @@ class Orchestrator:
                 return ChatResponse(
                     status="collecting",
                     planner=planner_output,
-                    progress=build_requirement_progress(
-                        merge_snapshot(working_memory, planner_output.collected_snapshot),
-                    ),
+                    progress=build_requirement_progress(merged_collected),
                     runtime=RuntimeStatus(
                         planner=AgentRuntimeStatus(
                             llm_enabled=planner_exec.llm_enabled,
@@ -98,12 +122,15 @@ class Orchestrator:
                         drawer=None,
                         layout=None,
                     ),
+                    notices=response_notices,
+                    has_site_outline=self._has_site_outline(session),
                 )
 
         assert isinstance(planner_output, PlannerFinalPlan)
         planner_output = reconcile_final_plan(
             planner_output,
             merge_snapshot(session.collected_requirements, working_memory),
+            outline=session.site_outline,
         )
         method = session.draw_method
 
@@ -153,6 +180,8 @@ class Orchestrator:
                     ) if method in ("multimodal", "both") else None,
                     layout=layout_exec_result._as_runtime() if layout_exec_result else None,
                 ),
+                notices=response_notices,
+                has_site_outline=self._has_site_outline(session),
             )
 
         session.planner_state = "completed"
@@ -202,6 +231,8 @@ class Orchestrator:
                 drawer=drawer_runtime,
                 layout=layout_runtime,
             ),
+            notices=response_notices,
+            has_site_outline=self._has_site_outline(session),
         )
 
     def _generate_layout(self, session, plan: PlannerFinalPlan):

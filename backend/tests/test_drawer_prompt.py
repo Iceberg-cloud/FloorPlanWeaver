@@ -23,6 +23,7 @@ def test_drawer_prompt_forbids_dimensions_and_long_text():
     )
     prompt = build_drawer_image_prompt(plan)
     assert "禁止" in prompt
+    assert "不标注房间名称" in prompt
     assert "客厅" in prompt and "主卧" in prompt
     assert "120" not in prompt
     assert "26" not in prompt and "18" not in prompt

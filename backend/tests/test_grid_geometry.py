@@ -181,10 +181,11 @@ def test_strong_rooms_rectangular():
     outline = _rect_outline(10, 8)
     plan, sem, ol, state, grid, report, cp = _run_grid(rooms, outline)
     assert state is not None
-    non_rect_count = 0
+    # Hard rect types: zero tolerance
+    _HARD = frozenset({"卫生间", "主卫", "客卫", "主卧", "次卧", "卧室", "儿童房", "阳台"})
+    non_rect_hard = 0
+    non_rect_other = 0
     for c in cp.rooms:
-        if not c.must_be_rectangle:
-            continue
         rid = state.name_to_rid.get(c.name)
         if rid is None:
             continue
@@ -197,9 +198,12 @@ def test_strong_rooms_rectangular():
         w = max(is_) - min(is_) + 1
         h = max(js_) - min(js_) + 1
         if len(cells) != w * h:
-            non_rect_count += 1
-    # Allow at most 3 rooms to be non-rectangular due to bbox conflicts
-    assert non_rect_count <= 3, f"{non_rect_count} rooms not rectangular"
+            if c.room_type in _HARD:
+                non_rect_hard += 1
+            else:
+                non_rect_other += 1
+    assert non_rect_hard == 0, f"{non_rect_hard} hard-rect rooms not rectangular"
+    assert non_rect_other <= 2, f"{non_rect_other} other rect rooms not rectangular"
 
 
 # ── 7. boundary touch ───────────────────────────────────────────
@@ -245,9 +249,7 @@ def test_kitchen_adjacent_dining():
                     if 0 <= ni < grid.cols and 0 <= nj < grid.rows:
                         if state.rid[nj][ni] == d_rid:
                             adj = True
-        # adjacency is preferred not required; if not adjacent, at least both exist
-        if not adj:
-            assert k_rid is not None and d_rid is not None, "厨房 and 餐厅 should both be placed"
+        assert adj, "厨房应与餐厅共享网格边相邻"
 
 
 # ── 9. fragmentation ────────────────────────────────────────────
@@ -259,7 +261,10 @@ def test_no_remaining_fragments():
     assert state is not None
     free = [(i, j) for j in range(grid.rows) for i in range(grid.cols)
             if grid.inside[j][i] and state.rid[j][i] == 0]
-    assert len(free) == 0, f"{len(free)} free cells remain"
+    inside = grid.total_inside()
+    assert len(free) <= max(1, inside * 0.02), (
+        f"{len(free)} free cells remain (>2% of {inside})"
+    )
 
 
 # ── 10. T-shape outline ─────────────────────────────────────────

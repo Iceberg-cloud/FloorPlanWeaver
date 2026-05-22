@@ -10,7 +10,11 @@ from app.agents.planner_agent import PlannerAgent
 from app.schemas.planner import PlannerFinalPlan, SpaceProgramItem
 
 if TYPE_CHECKING:
+    from app.schemas.layout import SiteOutline
     from app.schemas.session import ChatMessage
+
+_AREA_MISMATCH_ABS_SQM = 2.0
+_AREA_MISMATCH_RATIO = 0.05
 
 _REQUIRED_KEYS = PlannerAgent.REQUIRED_KEYS
 
@@ -191,17 +195,107 @@ def snapshot_from_final_plan(plan: PlannerFinalPlan) -> dict:
     }
 
 
-def reconcile_final_plan(plan: PlannerFinalPlan, collected: dict) -> PlannerFinalPlan:
-    """Prefer confirmed working memory for core profile fields."""
-    if not collected:
-        return plan
-    profile = plan.project_profile.model_copy(
-        update={
-            k: collected[k]
-            for k in ("building_type", "target_area_sqm", "layout_type", "orientation")
-            if collected.get(k) not in (None, "")
-        }
+def effective_outline_area_sqm(outline: SiteOutline | None) -> float | None:
+    """Positive outline area from saved geometry, or None if unavailable."""
+    if outline is None:
+        return None
+    from app.services.layout_metrics import outline_area_sqm
+
+    area = outline_area_sqm(outline)
+    return area if area > 0 else None
+
+
+def _areas_differ(user_sqm: float, outline_sqm: float) -> bool:
+    return abs(user_sqm - outline_sqm) > max(
+        _AREA_MISMATCH_ABS_SQM,
+        outline_sqm * _AREA_MISMATCH_RATIO,
     )
+
+
+def align_memory_with_outline(
+    memory: dict,
+    outline: SiteOutline | None,
+) -> tuple[dict, list[str]]:
+    """When a site outline exists, use its area as the authoritative target_area_sqm."""
+    merged = dict(memory or {})
+    notices: list[str] = []
+    outline_sqm = effective_outline_area_sqm(outline)
+    if outline_sqm is None:
+        return merged, notices
+
+    outline_sqm = round(outline_sqm, 1)
+    user_raw = merged.get("target_area_sqm")
+    user_f: float | None = None
+    if user_raw not in (None, ""):
+        try:
+            user_f = float(user_raw)
+        except (TypeError, ValueError):
+            user_f = None
+
+    merged["target_area_sqm"] = outline_sqm
+    merged["outline_area_sqm"] = outline_sqm
+    if user_f is not None and _areas_differ(user_f, outline_sqm):
+        notices.append(
+            f"已以外轮廓面积 {outline_sqm:.1f}㎡ 为准（对话中的 {user_f:g}㎡ 与轮廓不一致，已忽略）。"
+        )
+    return merged, notices
+
+
+def outline_reminder_notices(has_site_outline: bool) -> list[str]:
+    if has_site_outline:
+        return []
+    return [
+        "建议先在右侧「外轮廓编辑器」绘制并保存建筑外轮廓；"
+        "布局将按轮廓实际面积生成（未绘制时仅按默认矩形估算，可能与口述面积不一致）。",
+    ]
+
+
+def scale_space_program_to_target(
+    program: list[SpaceProgramItem],
+    new_target_sqm: float,
+    old_target_sqm: float | None,
+) -> list[SpaceProgramItem]:
+    old = float(old_target_sqm or 0)
+    if old <= 0 or not program:
+        return program
+    if abs(new_target_sqm - old) <= max(1.0, old * 0.02):
+        return program
+    scale = new_target_sqm / old
+    return [
+        item.model_copy(
+            update={
+                "target_area_sqm": round(max(3.0, (item.target_area_sqm or 8) * scale), 1),
+            }
+        )
+        for item in program
+    ]
+
+
+def reconcile_final_plan(
+    plan: PlannerFinalPlan,
+    collected: dict,
+    outline: SiteOutline | None = None,
+) -> PlannerFinalPlan:
+    """Prefer confirmed working memory; outline area overrides stated building area."""
+    if not collected and outline is None:
+        return plan
+
+    profile_updates: dict = {}
+    if collected:
+        profile_updates.update(
+            {
+                k: collected[k]
+                for k in ("building_type", "target_area_sqm", "layout_type", "orientation")
+                if collected.get(k) not in (None, "")
+            }
+        )
+
+    outline_sqm = effective_outline_area_sqm(outline)
+    if outline_sqm is not None:
+        profile_updates["target_area_sqm"] = round(outline_sqm, 1)
+
+    profile = plan.project_profile.model_copy(update=profile_updates) if profile_updates else plan.project_profile
+
     space_program = plan.space_program
     if collected.get("room_program"):
         space_program = [
@@ -209,6 +303,15 @@ def reconcile_final_plan(plan: PlannerFinalPlan, collected: dict) -> PlannerFina
             for item in collected["room_program"]
             if isinstance(item, dict) and item.get("room_type")
         ]
+
+    new_target = profile.target_area_sqm
+    if new_target and plan.project_profile.target_area_sqm:
+        space_program = scale_space_program_to_target(
+            space_program or plan.space_program,
+            float(new_target),
+            float(plan.project_profile.target_area_sqm),
+        )
+
     return plan.model_copy(
         update={
             "project_profile": profile,

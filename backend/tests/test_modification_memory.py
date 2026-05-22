@@ -132,7 +132,7 @@ def test_extract_prefer_edge_west():
 def test_extract_prefer_edge_default():
     assert _extract_prefer_edge("", "客厅") == "south"
     assert _extract_prefer_edge("", "阳台") == "south"
-    assert _extract_prefer_edge("", "厨房") == ""
+    assert _extract_prefer_edge("", "厨房") == "west"
 
 
 # ── Full regeneration flow ──────────────────────────────────────

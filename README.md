@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python" />
   <img src="https://img.shields.io/badge/FastAPI-0.1+-009688?style=flat-square&logo=fastapi&logoColor=white" alt="FastAPI" />
   <img src="https://img.shields.io/badge/Next.js-14-000?style=flat-square&logo=next.js&logoColor=white" alt="Next.js" />
-  <img src="https://img.shields.io/badge/Tests-113_passing-brightgreen?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/Tests-131_passing-brightgreen?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/License-MVP-demo-slate?style=flat-square" alt="License" />
 </p>
 
@@ -22,21 +22,155 @@
 
 前端提供：
 
-- 需求对话与快捷模板
+- 需求对话与快捷模板（点击填入输入框，确认后发送）
+- **外轮廓面积优先**：已保存外轮廓时，口述建筑面积与轮廓不一致则以轮廓为准，并提示先绘制外轮廓
 - **多环节思考进度**（规划师 / 布局顾问 / 布局工程师 / 设计师）
 - **正交外轮廓编辑器**（网格吸附、点击闭合、顶点拖拽）
 - 规划方案预览、矢量 / 多模态双视图
 - SVG 自适应字体渲染（前端直接渲染，中文字体完美显示）
+- **可折叠对话历史**（超过 8 条自动折叠，保留最近 5 条，支持滚轮滚动）
 
 ---
 
-## 一键启动（推荐）
+## 环境配置（从零开始）
 
-使用项目根目录启动脚本，自动拉起后端、前端并打开浏览器：
+以下步骤假设你尚未安装本项目运行环境。完成后**优先使用项目根目录的 `run.py` 启动**（见「启动项目」）；仅在调试时才分终端手动启动。
 
-```powershell
-# Windows（推荐使用 Anaconda Agent 环境）
-E:\ananconda\envs\Agent\python.exe run.py
+### 0. 前置软件
+
+| 软件 | 版本要求 | 用途 |
+|------|----------|------|
+| [Python](https://www.python.org/downloads/) | **3.10 或以上**（建议 3.10 / 3.11） | 后端、测试、`run.py` |
+| [Node.js](https://nodejs.org/) | **18 LTS 或以上**（自带 npm） | 前端 Next.js |
+| Git（可选） | 任意较新版本 | 克隆仓库 |
+
+安装 Python 后请确认命令可用：
+
+```bash
+python --version    # 或 Windows 上 py -3.10 --version
+node --version
+npm --version
+```
+
+> **Windows 提示**：安装 Python 时勾选 "Add python.exe to PATH"。若 `python` 不可用，可尝试 `py -3.10`。
+
+### 1. 获取项目代码
+
+```bash
+git clone <你的仓库地址> FloorPlanWeaver
+cd FloorPlanWeaver
+```
+
+若已是压缩包，解压后进入项目根目录（包含 `run.py`、`backend`、`frontend` 的目录）。
+
+### 2. 创建 Python 环境并安装后端依赖
+
+任选 **A（venv，推荐）** 或 **B（Conda）**，不要混用两套环境。
+
+#### 方式 A：venv（Windows / macOS / Linux 通用）
+
+在项目根目录执行：
+
+```bash
+# 创建虚拟环境（目录名 .venv 可自定）
+python -m venv .venv
+
+# 激活（每次新开终端都要先激活）
+# Windows PowerShell:
+.\.venv\Scripts\Activate.ps1
+# Windows CMD:
+.\.venv\Scripts\activate.bat
+# macOS / Linux:
+source .venv/bin/activate
+
+# 升级 pip 并安装后端依赖
+pip install --upgrade pip
+pip install -r backend/requirements.txt
+```
+
+#### 方式 B：Conda / Miniconda
+
+```bash
+conda create -n floorplanweaver python=3.10 -y
+conda activate floorplanweaver
+pip install --upgrade pip
+pip install -r backend/requirements.txt
+```
+
+### 3. 配置后端环境变量 `.env`
+
+```bash
+cd backend
+```
+
+复制模板（Windows PowerShell 用 `copy`，macOS/Linux 用 `cp`）：
+
+```bash
+# Windows
+copy .env.example .env
+# macOS / Linux
+cp .env.example .env
+```
+
+用文本编辑器打开 `backend/.env`，至少配置 LLM 网关（否则需将 `LLM_MOCK_MODE=true` 用于本地无密钥调试）：
+
+| 变量 | 说明 | 示例 |
+|------|------|------|
+| `LLM_PROVIDER` | 兼容 OpenAI 的网关 | `openai` |
+| `LLM_API_BASE` | API 根地址 | `https://your-gateway/v1` |
+| `LLM_API_KEY` | 密钥（勿提交到 Git） | `sk-...` |
+| `LLM_MOCK_MODE` | 无密钥时走 mock | `false` |
+| `PLANNER_USE_LLM` | 规划师是否调 LLM | `true` |
+| `DRAWER_USE_LLM` | 设计师是否调多模态 | `true` |
+| `DRAWER_FALLBACK_TO_RULE` | 出图失败时规则兜底 | `true` |
+| `PLANNER_MODEL` / `DRAWER_MODEL` | 模型名 | 见 `.env.example` |
+| `LAYOUT_USE_GRID_COMPILER` | 方案 A 网格 beam search | `true` |
+| `PLANNER_MAX_ASK_ROUNDS` | 最多追问轮数（1=追问一次后出图） | `1` |
+| `SESSION_STORE` | 会话存储 | `sqlite` |
+| `SESSION_DB_PATH` | SQLite 路径 | `backend/data/sessions.db` |
+
+完整列表见 [`backend/.env.example`](backend/.env.example)。配置完成后回到项目根目录：`cd ..`。
+
+### 4. 安装前端依赖
+
+```bash
+cd frontend
+npm install
+cd ..
+```
+
+（可选）后端不在本机 `8000` 端口时，在 `frontend` 下新建 `.env.local`：
+
+```ini
+NEXT_PUBLIC_API_BASE=http://127.0.0.1:8000/api/v1
+```
+
+### 5. 自检（确认环境正确）
+
+**先激活** 第 2 步中的 Python 虚拟环境，再执行：
+
+```bash
+cd backend
+python -m pytest tests/ -q
+cd ../frontend
+npx tsc --noEmit
+cd ..
+```
+
+无报错即表示 Python 依赖与前端类型检查通过。
+
+---
+
+## 启动项目
+
+完成「环境配置」后启动应用。**请优先使用 `run.py`**：一条命令拉起后端与前端并打开浏览器。分终端手动启动仅用于单独调试某一端。
+
+### 推荐：`run.py`（默认）
+
+在**已激活 Python 环境**的前提下，于**项目根目录**执行：
+
+```bash
+python run.py
 ```
 
 | 服务 | 地址 |
@@ -45,7 +179,31 @@ E:\ananconda\envs\Agent\python.exe run.py
 | 后端 API | http://localhost:8000 |
 | 健康检查 | http://localhost:8000/api/v1/health |
 
-`run.py` 会优先使用 `E:\ananconda\envs\Agent\python.exe`，启动前自动尝试释放 **8000 / 3001** 端口。
+说明：
+
+- `run.py` 使用**当前终端里的 `python`**（即你激活的 venv / conda）；需已执行 `pip install -r backend/requirements.txt` 与 `cd frontend && npm install`。
+- Windows 下脚本会尝试释放被占用的 **8000 / 3001** 端口。
+- 仓库内若配置了 `PREFERRED_PYTHON` 且路径存在，会优先使用该解释器；新用户一般只需 `python run.py`。
+
+### 备选：手动分终端启动
+
+仅在需要分别调试后端/前端、或不用 `run.py` 时使用。环境变量与依赖安装要求与上文相同。
+
+**终端 1 — 后端**
+
+```bash
+cd backend
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+**终端 2 — 前端**
+
+```bash
+cd frontend
+npm run dev
+```
+
+默认前端请求 `http://localhost:8000/api/v1`；端口或主机不同时，在 `frontend/.env.local` 设置 `NEXT_PUBLIC_API_BASE`。
 
 ---
 
@@ -53,7 +211,7 @@ E:\ananconda\envs\Agent\python.exe run.py
 
 ```
 FloorPlanWeaver/
-├── run.py                 # 一键启动前后端
+├── run.py                 # 推荐：同时启动前后端
 ├── backend/
 │   ├── app/
 │   │   ├── agents/        # Planner / Layout / Drawer 提示与解析
@@ -62,49 +220,12 @@ FloorPlanWeaver/
 │   │   ├── renderers/     # SVG 渲染器（自适应字体 + 精确标签定位）
 │   │   ├── schemas/       # Pydantic 模型
 │   │   └── services/      # 规划、布局编译、后处理、LLM 客户端、记忆管理
-│   └── tests/             # pytest（113 个测试用例）
+│   └── tests/             # pytest（131 个测试用例）
 └── frontend/
     ├── app/               # Next.js 页面
     ├── components/        # 对话、轮廓编辑器、方案、平面图、思考流水线 UI
     └── lib/               # API、布局/规划归一化、多边形渲染、流水线阶段定义
 ```
-
----
-
-## 手动启动
-
-### 1. 后端
-
-```bash
-cd backend
-copy .env.example .env    # Windows；Linux/macOS 用 cp
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-`.env` 常用项：
-
-```ini
-PLANNER_USE_LLM=true
-DRAWER_USE_LLM=true
-LLM_API_BASE=https://your-llm-gateway/v1
-LLM_API_KEY=sk-...
-PLANNER_MODEL=your-planner-model
-# 规划师最多追问轮数（1=追问一次后强制出图；2=最多两轮追问）
-PLANNER_MAX_ASK_ROUNDS=1
-DRAWER_MODEL=your-drawer-model
-LAYOUT_USE_GRID_COMPILER=true
-```
-
-### 2. 前端
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-默认连接 `http://localhost:8000/api/v1`，可通过 `NEXT_PUBLIC_API_BASE` 覆盖。
 
 ---
 
@@ -117,7 +238,8 @@ flowchart LR
     P -->|FINAL_PLAN| L[布局顾问 Semantic LLM]
     L --> C[网格 Beam Search 编译]
     C --> R[自动修复 + 面积校正]
-    R --> V[矢量 SVG]
+    R --> F[100% 轮廓填充]
+    F --> V[矢量 SVG]
     P --> D[设计师 Drawer]
     D --> I[户型效果图]
 ```
@@ -125,14 +247,26 @@ flowchart LR
 ### 矢量布局（方法 A — Grid Search）
 
 1. **语义层**：LLM 输出 `center_x/y`、`width_ratio/height_ratio` 等归一化位置与大小（非绝对坐标）
-2. **网格搜索层**：0.25m 精度网格，Beam Search（宽度 16）+ 贪心回退放置所有房间
-3. **自动修复**：面积双向校正、矩形化强制（卫生间/卧室/阳台/厨房保证轴对齐矩形）、碎片吸收、灵活房间补偿
-4. **几何校验**：覆盖率、无重叠、无间隙、连通性、矩形约束、边界贴合、邻接关系
-5. **多边形导出**：矩形房间用 bbox、异形房间用 boundary polygonization
+2. **约束合并**：将 Planner 邻接图（`adjacency_graph`）与语义层邻接意图合并，厨房→餐厅为硬邻接约束
+3. **网格搜索层**：0.25m 精度网格，Beam Search（宽度 16）+ 贪心回退放置所有房间；餐厅先于厨房放置以保证邻接
+4. **自动修复**：面积双向校正、矩形化强制（卫生间/卧室/阳台保证轴对齐矩形且不超目标 135%）、碎片吸收、灵活房间补偿、断开区域愈合
+5. **100% 轮廓填充**：迭代 `fill → compact → heal` 循环，确保外轮廓内无空白区域
+6. **几何校验**：覆盖率、无重叠、无间隙、连通性、矩形约束、边界贴合、邻接关系
+7. **多边形导出**：硬矩形房间用 4 点 bbox、弹性房间（客厅/餐厅/书房）用 boundary polygonization
 
 ### 房间矩形保证
 
-以下房间类型强制输出为轴对齐矩形：**卫生间、卧室、阳台、厨房**。通过 `_force_rect` 从灵活房间（客厅、餐厅等）回收网格单元实现。被夺取的灵活房间会通过 BFS 从附近空闲区域获得等量补偿。
+以下房间类型强制输出为轴对齐矩形且面积不超过目标 135%：**卫生间、主卧、次卧、卧室、阳台**。通过 `_compact_to_solid_rect`（限制最大面积的内接矩形搜索）实现。厨房可为矩形或 L 形。
+
+### 放置优先级
+
+房间按以下顺序放置，确保邻接关系：
+
+1. 卫生间 / 阳台 / 卧室（贴边、硬矩形）
+2. **餐厅**（有厨房时先进 strong 分区，确保厨房可贴邻放置）
+3. 厨房（贴餐厅，评分中厨房-餐厅邻接权重 ×3）
+4. 书房
+5. 客厅 / 客餐厅（填充剩余最大连续区域）
 
 ### 绘图方式
 
@@ -218,6 +352,7 @@ flowchart LR
 - **自适应字体**：根据房间面积分 4 档字体大小（≥14㎡/≥8㎡/≥4㎡/<4㎡），小于 3㎡ 的房间只显示名称
 - **精确标签定位**：`polygonLabelCenter` 算法确保标签始终在房间内部，不重叠
 - **动态 viewBox**：自动计算所有顶点范围，添加 padding 确保不裁剪
+- **clipPath 裁剪**：房间名称不超过房间边界，长名自动截断
 - **中文完美支持**：使用系统字体栈（Microsoft YaHei / PingFang SC / Noto Sans SC）
 - **多模态绘图无文字**：方法 B 出图提示词明确禁止任何文字标注，仅以颜色分区和墙体线条表达
 
@@ -239,9 +374,11 @@ flowchart LR
 
 ## 测试
 
+在已激活的 Python 环境中：
+
 ```bash
 cd backend
-E:\ananconda\envs\Agent\python.exe -m pytest tests/ -q
+python -m pytest tests/ -q
 ```
 
 ```bash
@@ -249,26 +386,33 @@ cd frontend
 npx tsc --noEmit
 ```
 
-113 个后端测试覆盖：
+131 个后端测试覆盖：
 - 跨轮记忆与偏好提取（`test_cross_turn_memory.py`，13 个用例）
 - 修改意图检测与位置约束（`test_modification_memory.py`，16 个用例）
 - 房间提取边界场景（`test_room_extraction.py`，6 个用例）
 - 记忆合并与快照（`test_requirement_memory.py`）
 - 规划师多轮对话（`test_planner_memory_flow.py`）
-- 网格搜索布局几何正确性（`test_grid_geometry.py`）
-- 9 房间完整布局覆盖（`test_vector_layout_coverage.py`）
+- **网格搜索几何正确性**（`test_grid_geometry.py`，22 个用例）：覆盖率、无间隙、连通性、矩形约束、厨房邻接餐厅
+- **9 房间完整布局覆盖**（`test_vector_layout_coverage.py`，6 个用例）
+- **硬矩形房间强制实心**（`test_rect_enforcement.py`，10 个用例）
+- **客厅面积接近目标**（`test_living_room_area.py`，4 个用例）
+- **多边形导出无重叠**（`test_polygon_export_overlap.py`）
+- **网格搜索布局**（`test_grid_search_layout.py`）：优先级顺序、邻接图合并、厨房-餐厅 must 邻接
+- 语义布局编译（`test_semantic_layout.py`）
 - API 集成全链路（`test_chat_integration.py`）
 - SVG 绘制提示词（`test_drawer_prompt.py`）
+- 外轮廓面积优先（`test_outline_area_priority.py`）
+- 会话清理（`test_session_cleanup.py`）
 
 ---
 
 ## 常见问题
 
 **Q: 界面提示 `PlannerAskForMore` 校验错误？**
-A: 已在后端对 LLM 残缺 JSON 做补全与回退。请**完全重启** `run.py` 或 uvicorn，避免旧进程未加载新代码。
+A: 已在后端对 LLM 残缺 JSON 做补全与回退。请**完全重启** `python run.py`（推荐）；若用手动启动则重启对应 uvicorn 进程，避免旧代码未加载。
 
 **Q: 端口被占用？**
-A: 使用 `run.py` 会自动尝试释放 8000/3001；或手动 `netstat` + `taskkill` 结束占用进程。
+A: 优先重新执行 `python run.py`，脚本会自动尝试释放 8000/3001；仍占用时可 `netstat` + `taskkill`（Windows）或结束对应进程。
 
 **Q: 矢量图房间数为 0 或报错？**
 A: 前端已用 `normalizeLayout()` 适配后端嵌套 `layout.layout.rooms` 结构，请拉取最新前端代码。
@@ -277,7 +421,13 @@ A: 前端已用 `normalizeLayout()` 适配后端嵌套 `layout.layout.rooms` 结
 A: 网格搜索编译器（`compile_method=grid_search`）已确保几何正确性：房间不超出外轮廓、内部紧密贴合、关键房间强制矩形。后处理跳过 `grid_search` 结果以保持精度。
 
 **Q: 卫生间/卧室/阳台不是矩形？**
-A: `_force_rect` 会从灵活房间（客厅、餐厅）中回收单元格，强制上述房间为轴对齐矩形。被夺取的灵活房间会通过 BFS 补偿等量面积。
+A: `_compact_to_solid_rect`（限制面积上限的内接矩形搜索）强制上述房间为轴对齐实心矩形，面积不超过目标 135%。
+
+**Q: 轮廓内有空白未分配区域？**
+A: 已通过迭代 `fill → compact → heal` 循环确保 100% 轮廓填充。客厅等弹性房间会吸收所有剩余空间。
+
+**Q: 厨房没有与餐厅相邻？**
+A: 厨房-餐厅邻接为硬约束（`must`）：餐厅先于厨房放置，厨房评分中邻接餐厅权重 ×3，默认语义布局中厨房-餐厅为 `must` 邻接。
 
 **Q: 提示 `LLM 调用失败: The read operation timed out`？**
 A: 模型响应慢，默认硬限制 120s（`LLM_HARD_TIMEOUT_SECONDS`）。请重启后端重试；仍慢可换 `*-Flash` 模型或检查 `LLM_API_BASE` 网络。
@@ -294,6 +444,9 @@ A: 不会。系统会检测修改意图，保留所有已提取的房间，只�
 **Q: SVG 中文显示为方块或空白？**
 A: 已修复。前端使用 React SVG 直接渲染（非内嵌 base64），使用系统字体栈（Microsoft YaHei / PingFang SC / Noto Sans SC），中文完美显示。
 
+**Q: 房间名称超出房间边界？**
+A: 已修复。前端使用 `clipPath` 裁剪房间名称，长名自动截断，确保文字不溢出房间区域。
+
 **Q: 规划师漏掉了卧室等房间？**
 A: 已修复。房间提取支持"卧室"（14㎡）、"客餐厅"（22㎡）等复合名，复合名优先匹配避免重复。例如"一室一厅，需要卧室、客餐厅一体"会正确提取 5 个房间。
 
@@ -304,8 +457,8 @@ A: 关闭页面（`pagehide`）或点击「关闭服务」时，会调用 `/sess
 
 ## 技术栈
 
-- **后端**：FastAPI · Pydantic v2 · 自研网格 Beam Search 布局编译器 · OpenAI 兼容 LLM 网关 · 跨轮记忆系统 · 修改意图检测
-- **前端**：Next.js 14 · React · TypeScript · Tailwind CSS · SVG 正交轮廓编辑器 · 自适应字体渲染
+- **后端**：FastAPI · Pydantic v2 · 自研网格 Beam Search 布局编译器 · OpenAI 兼容 LLM 网关 · 跨轮记忆系统 · 修改意图检测 · 邻接约束合并
+- **前端**：Next.js 14 · React · TypeScript · Tailwind CSS · SVG 正交轮廓编辑器 · 自适应字体渲染 · clipPath 文字裁剪
 
 ---
 

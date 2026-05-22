@@ -13,6 +13,12 @@ PLANNER_SYSTEM_PROMPT = """
 - FINAL_PLAN 必须包含完整动线 circulation（main_route、secondary_routes、principle）；
 - 输出必须为严格 JSON。
 
+空间与邻接（矢量布置 Method A 会严格执行）：
+- space_program 各房间 target_area_sqm 之和应接近 target_area_sqm（约 85%～105%），避免漏房间或面积严重失衡；
+- 有厨房且有餐厅时，adjacency_graph 必须包含一条：厨房→餐厅，relation=required，description 说明备餐动线；
+- 客厅通常是面积最大的公共空间；卫生间/阳台/卧室宜贴外轮廓；
+- adjacency_graph 至少 3 条有效边（含 required 或 preferred），勿留空数组。
+
 输出状态：
 - ASK_FOR_MORE: missing_fields、follow_up_questions（≤2条）、collected_snapshot
 - FINAL_PLAN: project_profile、space_program、adjacency_graph、circulation、zoning、drawing_brief 等
