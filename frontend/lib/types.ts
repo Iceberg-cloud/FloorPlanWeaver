@@ -95,6 +95,8 @@ export type ChatResponse = {
   area_coverage_ratio?: number | null;
   planned_area_sqm?: number | null;
   outline_area_sqm?: number | null;
+  notices?: string[];
+  has_site_outline?: boolean;
   progress: {
     collected_fields: string[];
     missing_fields: string[];

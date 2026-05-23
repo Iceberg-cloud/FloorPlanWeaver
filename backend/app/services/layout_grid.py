@@ -516,6 +516,27 @@ class GridMap:
             return pts
         return self.cells_to_bbox_polygon(room_id)
 
+    def export_room_polygon(
+        self,
+        room_id: int,
+        *,
+        prefer_rectangle: bool = False,
+    ) -> tuple[list[tuple[float, float]], str]:
+        """Export geometry that matches grid cells (no inflated bbox over neighbors).
+
+        Grid cells are disjoint; bbox of an L-shaped cell set can visually cover
+        another room's cells. Use boundary trace unless the room is a solid rectangle.
+        """
+        if self.cells_are_single_rect(room_id):
+            return self.cells_to_bbox_polygon(room_id), "rect"
+        boundary = self.cells_to_boundary_polygon(room_id)
+        if len(boundary) >= 3:
+            if prefer_rectangle and len(boundary) == 4:
+                return boundary, "rect"
+            return boundary, "polygon"
+        bbox = self.cells_to_bbox_polygon(room_id)
+        return bbox, "rect" if bbox else "polygon"
+
     def assign_cells_to_room(
         self,
         room_id: int,

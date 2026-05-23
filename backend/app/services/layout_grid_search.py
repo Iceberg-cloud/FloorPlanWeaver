@@ -16,10 +16,16 @@ from app.schemas.layout_constraints import (
 from app.schemas.planner import PlannerFinalPlan
 from app.schemas.semantic_layout import SemanticLayoutPlan
 from app.services.layout_constraint_builder import build_constraint_plan
-from app.services.layout_grid import CELL_AREA, GridMap
+from app.services.layout_grid import CELL_AREA, CELL_SIZE, GridMap
 
 BEAM_WIDTH = 16
 MAX_CANDIDATES_PER_ROOM = 24
+
+_HARD_RECT_TYPES = frozenset({
+    "卫生间", "主卫", "客卫", "洗手间", "厕所",
+    "主卧", "次卧", "卧室", "儿童房",
+    "阳台",
+})
 
 
 @dataclass
@@ -96,9 +102,19 @@ def _can_place(state: SearchState, grid: GridMap, cells: list[tuple[int, int]]) 
     return bool(cells)
 
 
-def _apply_cells(state: SearchState, room_id: int, cells: list[tuple[int, int]]) -> None:
+def _apply_cells(
+    state: SearchState,
+    grid: GridMap,
+    room_id: int,
+    cells: list[tuple[int, int]],
+) -> None:
+    """Assign cells only if free or already owned by this room (never steal neighbors)."""
     for i, j in cells:
-        state.rid[j][i] = room_id
+        if not grid.inside[j][i]:
+            continue
+        cur = state.rid[j][i]
+        if cur == 0 or cur == room_id:
+            state.rid[j][i] = room_id
 
 
 def _free_components(state: SearchState, grid: GridMap) -> list[list[tuple[int, int]]]:
@@ -265,17 +281,21 @@ def _score_candidate(
     score = -area_err * 40.0
 
     if constraint.must_touch_outline:
+        touch_bonus = 15.0 if constraint.room_type == "厨房" else 10.0
+        touch_penalty = 35.0 if constraint.room_type == "厨房" else 25.0
         if any(_touches_outline(grid, i, j) for i, j in cells):
-            score += 10.0
+            score += touch_bonus
         else:
-            score -= 25.0
-
+            score -= touch_penalty
     score += _zone_center_score(grid, cells, plan.entrance_side, constraint.zone_preference)
     score += _orientation_score(
         grid, cells, constraint.preferred_orientation or plan.public_side, plan.public_side,
     )
     score += _position_hint_score(grid, cells, constraint)
     score += _adjacency_bonus(state, grid, 0, cells, constraint)
+    from app.services.room_layout_conventions import convention_adjacency_score
+
+    score += convention_adjacency_score(state, grid, constraint, cells)
     for name in constraint.adjacency_required:
         oid = state.name_to_rid.get(name)
         if oid and any(
@@ -284,9 +304,21 @@ def _score_candidate(
             for ni, nj in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1))
             if 0 <= ni < grid.cols and 0 <= nj < grid.rows
         ):
-            score += 8.0
+            score += 12.0 if constraint.room_type == "厨房" else 8.0
         else:
-            score -= 12.0
+            score -= 22.0 if constraint.room_type == "厨房" else 12.0
+    if constraint.room_type == "厨房":
+        for dining_name in ("餐厅", "客餐厅"):
+            oid = state.name_to_rid.get(dining_name)
+            if oid and any(
+                state.rid[nj][ni] == oid
+                for i, j in cells
+                for ni, nj in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1))
+                if 0 <= ni < grid.cols and 0 <= nj < grid.rows
+            ):
+                score += 15.0
+            elif oid is not None:
+                score -= 18.0
 
     wi = max(p[0] for p in cells) - min(p[0] for p in cells) + 1
     hj = max(p[1] for p in cells) - min(p[1] for p in cells) + 1
@@ -294,9 +326,22 @@ def _score_candidate(
     if aspect < constraint.aspect_min or aspect > constraint.aspect_max:
         score -= 8.0
 
+    # Enforce hard rectangularity for bathroom/bedroom/balcony
+    if constraint.room_type in _HARD_RECT_TYPES:
+        if len(cells) != wi * hj:
+            score -= 200.0
+        # Minimum short-side from conventions
+        from app.services.room_layout_conventions import ROOM_TYPICAL_SIZE
+        short_m = min(wi, hj) * CELL_SIZE
+        typ = ROOM_TYPICAL_SIZE.get(constraint.room_type)
+        if typ:
+            min_short = typ[1] * 0.7
+            if short_m < min_short:
+                score -= 80.0
+
     trial = state.copy()
     trial_rid = state.name_to_rid.get(constraint.name, state.next_rid)
-    _apply_cells(trial, trial_rid, cells)
+    _apply_cells(trial, grid, trial_rid, cells)
     comps = _free_components(trial, grid)
     score -= _fragmentation_penalty(comps, rooms_left)
 
@@ -389,16 +434,102 @@ def _place_bfs_region(
     return claimed
 
 
+def _grow_room_one_free_cell(
+    state: SearchState,
+    grid: GridMap,
+    rid: int,
+    *,
+    prefer_front: bool = False,
+    entrance_side: str = "bottom",
+) -> bool:
+    """Claim one adjacent free cell; optionally prefer public/front zone (客厅布置惯例)."""
+    candidates: list[tuple[float, int, int, int]] = []
+    for j in range(grid.rows):
+        for i in range(grid.cols):
+            if state.rid[j][i] != rid:
+                continue
+            for ni, nj in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)):
+                if not (0 <= ni < grid.cols and 0 <= nj < grid.rows):
+                    continue
+                if not grid.inside[nj][ni] or state.rid[nj][ni] != 0:
+                    continue
+                score = 0.0
+                if prefer_front:
+                    score = _zone_center_score(
+                        grid, [(ni, nj)], entrance_side, "south",
+                    )
+                candidates.append((score, ni, nj))
+    if not candidates:
+        return False
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    _, ni, nj = candidates[0]
+    state.rid[nj][ni] = rid
+    return True
+
+
+def _fill_flex_room_to_target(
+    state: SearchState,
+    grid: GridMap,
+    rid: int,
+    constraint: RoomPlacementConstraint,
+    plan: LayoutConstraintPlan,
+) -> None:
+    """BFS seed + iterative border grow until target area (GB 50096 客厅为剩余公共空间主体)."""
+    target = max(1, GridMap.target_cells(constraint.target_area_sqm))
+    comps = _free_components(state, grid)
+    if not comps:
+        return
+    comps.sort(key=len, reverse=True)
+
+    if constraint.must_be_rectangle and constraint.room_type in ("厨房", "书房"):
+        cands = _generate_rect_candidates(state, grid, constraint, plan, 1)
+        if cands:
+            _apply_cells(state, grid, rid, cands[0].cells)
+            return
+    if constraint.room_type in _HARD_RECT_TYPES:
+        cands = _generate_rect_candidates(state, grid, constraint, plan, 1)
+        if cands:
+            _apply_cells(state, grid, rid, cands[0].cells)
+            return
+
+    prefer_entrance = constraint.room_type in _LIVING_FLEX_TYPES or constraint.room_type == "餐厅"
+    seed_comp = comps[0]
+    if prefer_entrance:
+        seed_comp = sorted(seed_comp, key=lambda c: (c[1], c[0]))
+    seed = seed_comp[0]
+    _place_bfs_region(state, grid, rid, seed, target)
+
+    if _count_room_rid(state.rid, grid, rid) < target // 2:
+        for comp in comps[1:]:
+            if _count_room_rid(state.rid, grid, rid) >= target:
+                break
+            sub_seed = sorted(comp, key=lambda c: (c[1], c[0]))[0] if prefer_entrance else comp[0]
+            _place_bfs_region(
+                state, grid, rid, sub_seed,
+                target - _count_room_rid(state.rid, grid, rid),
+            )
+
+    prefer_front = constraint.room_type in _LIVING_FLEX_TYPES
+    while _count_room_rid(state.rid, grid, rid) < target:
+        if not _grow_room_one_free_cell(
+            state, grid, rid,
+            prefer_front=prefer_front,
+            entrance_side=plan.entrance_side,
+        ):
+            break
+
+
 def _fill_flexible_rooms(
     state: SearchState,
     grid: GridMap,
     flex_constraints: list[RoomPlacementConstraint],
     plan: LayoutConstraintPlan,
 ) -> None:
-    living = [c for c in flex_constraints if c.room_type in ("客厅", "起居室", "客餐厅")]
+    # 先餐厅/书房，后客厅：保证客厅占据南侧/入口侧最大连续公共空间
+    living = [c for c in flex_constraints if c.room_type in _LIVING_FLEX_TYPES]
     dining = [c for c in flex_constraints if c.room_type == "餐厅"]
     other = [c for c in flex_constraints if c not in living and c not in dining]
-    order = dining + living + other
+    order = dining + other + living
 
     for constraint in order:
         rid = state.name_to_rid.get(constraint.name)
@@ -408,39 +539,111 @@ def _fill_flexible_rooms(
             state.name_to_rid[constraint.name] = rid
             state.room_names[rid] = constraint.name
 
-        target = max(1, GridMap.target_cells(constraint.target_area_sqm))
-        comps = _free_components(state, grid)
-        if not comps:
+        _fill_flex_room_to_target(state, grid, rid, constraint, plan)
+
+    flex_caps = _flex_cap_cells_by_rid(flex_constraints, state)
+    _merge_fragments(state, grid, plan, max_cells_by_rid=flex_caps)
+    _trim_oversized_flex_rooms(state, grid, flex_constraints)
+    flex_caps = _flex_cap_cells_by_rid(flex_constraints, state)
+    if _count_unassigned(state, grid) > 0:
+        _merge_fragments(state, grid, plan, max_cells_by_rid=flex_caps)
+
+
+_FLEX_FILL_TYPES = frozenset({"客厅", "餐厅", "起居室", "客餐厅", "书房"})
+_LIVING_FLEX_TYPES = frozenset({"客厅", "起居室", "客餐厅"})
+
+
+def _trim_oversized_flex_rooms(
+    state: SearchState,
+    grid: GridMap,
+    flex_constraints: list[RoomPlacementConstraint],
+) -> None:
+    """Cap flexible rooms (esp. 客厅) after gap-fill so area matches program targets."""
+    for c in flex_constraints:
+        rid = state.name_to_rid.get(c.name)
+        if rid is None:
             continue
-        comps.sort(key=len, reverse=True)
-
-        if constraint.must_be_rectangle and constraint.room_type in ("厨房", "书房"):
-            cands = _generate_rect_candidates(state, grid, constraint, plan, 1)
-            if cands:
-                _apply_cells(state, rid, cands[0].cells)
-                continue
-
-        seed_comp = comps[0]
-        prefer_entrance = constraint.room_type in ("客厅", "餐厅", "起居室")
-        if prefer_entrance:
-            seed_comp.sort(key=lambda c: (c[1], c[0]))
-        seed = seed_comp[0]
-        _place_bfs_region(state, grid, rid, seed, target)
-
-        if _count_room_rid(state.rid, grid, rid) < target // 2:
-            for comp in comps[1:]:
-                if _count_room_rid(state.rid, grid, rid) >= target:
-                    break
-                _place_bfs_region(
-                    state, grid, rid, comp[0],
-                    target - _count_room_rid(state.rid, grid, rid),
+        target = max(1, GridMap.target_cells(c.target_area_sqm))
+        if c.room_type in _LIVING_FLEX_TYPES:
+            # 客厅：单 flex 时 merge 易膨胀，上限贴近 program（约 10–35% 套内面积）
+            cap_ratio = 1.0 + min(0.08, c.area_tolerance * 0.25)
+        else:
+            cap_ratio = 1.0 + min(0.22, c.area_tolerance * 0.75)
+        cap = max(4, int(target * cap_ratio))
+        min_keep = max(4, int(target * 0.7))
+        for _ in range(800):
+            cur = _count_room_rid(state.rid, grid, rid)
+            if cur <= cap:
+                break
+            if cur <= min_keep:
+                break
+            border = [
+                (i, j) for j in range(grid.rows) for i in range(grid.cols)
+                if state.rid[j][i] == rid
+                and any(
+                    0 <= ni < grid.cols and 0 <= nj < grid.rows
+                    and state.rid[nj][ni] != rid
+                    for ni, nj in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1))
                 )
+            ]
+            if not border:
+                break
+            i, j = border[0]
+            state.rid[j][i] = 0
 
-    _merge_fragments(state, grid, plan)
+
+def _flex_fill_rids(state: SearchState) -> set[int]:
+    out: set[int] = set()
+    for rid, name in state.room_names.items():
+        base = name
+        if base and base[-1].isdigit():
+            i = len(base) - 1
+            while i > 0 and base[i - 1].isdigit():
+                i -= 1
+            base = base[:i]
+        if base in _FLEX_FILL_TYPES:
+            out.add(rid)
+    return out
 
 
-def _merge_fragments(state: SearchState, grid: GridMap, plan: LayoutConstraintPlan) -> None:
+def _flex_cap_cells_by_rid(
+    flex_constraints: list[RoomPlacementConstraint],
+    state: SearchState,
+) -> dict[int, int]:
+    """Max grid cells per flex room (used to block gap-fill over area cap)."""
+    caps: dict[int, int] = {}
+    for c in flex_constraints:
+        rid = state.name_to_rid.get(c.name)
+        if rid is None:
+            continue
+        target = max(1, GridMap.target_cells(c.target_area_sqm))
+        if c.room_type in _LIVING_FLEX_TYPES:
+            ratio = 1.0 + min(0.08, c.area_tolerance * 0.25)
+        else:
+            ratio = 1.0 + min(0.22, c.area_tolerance * 0.75)
+        caps[rid] = max(4, int(target * ratio))
+    return caps
+
+
+def _merge_fragments(
+    state: SearchState,
+    grid: GridMap,
+    plan: LayoutConstraintPlan,
+    *,
+    exclude_rids: set[int] | None = None,
+    max_cells_by_rid: dict[int, int] | None = None,
+) -> None:
     """Assign every remaining free cell to best adjacent room (fill gaps)."""
+    flex_rids = _flex_fill_rids(state)
+    blocked = exclude_rids or set()
+    caps = max_cells_by_rid or {}
+
+    def _at_cap(oid: int) -> bool:
+        cap = caps.get(oid)
+        if cap is None:
+            return False
+        return _count_room_rid(state.rid, grid, oid) >= cap
+
     changed = True
     while changed:
         changed = False
@@ -453,14 +656,16 @@ def _merge_fragments(state: SearchState, grid: GridMap, plan: LayoutConstraintPl
                     ni, nj = i + di, j + dj
                     if 0 <= ni < grid.cols and 0 <= nj < grid.rows:
                         oid = state.rid[nj][ni]
-                        if oid > 0:
+                        if oid > 0 and oid not in blocked and not _at_cap(oid):
                             votes[oid] = votes.get(oid, 0) + 1
                 if votes:
-                    best = max(votes, key=votes.get)
+                    flex_votes = {r: v for r, v in votes.items() if r in flex_rids}
+                    pool = flex_votes or votes
+                    best = max(pool, key=pool.get)
                     state.rid[j][i] = best
                     changed = True
-                elif state.name_to_rid:
-                    rid = next(iter(state.name_to_rid.values()))
+                elif flex_rids:
+                    rid = next(iter(flex_rids))
                     state.rid[j][i] = rid
                     changed = True
 
@@ -470,6 +675,13 @@ def _count_room_rid(rid: list[list[int]], grid: GridMap, room_id: int) -> int:
     return sum(
         1 for j in range(grid.rows) for i in range(grid.cols)
         if grid.inside[j][i] and rid[j][i] == room_id
+    )
+
+
+def _count_unassigned(state: SearchState, grid: GridMap) -> int:
+    return sum(
+        1 for j in range(grid.rows) for i in range(grid.cols)
+        if grid.inside[j][i] and state.rid[j][i] == 0
     )
 
 
@@ -513,7 +725,7 @@ def _beam_search(
                     child = st.copy()
                     child.name_to_rid[constraint.name] = rid
                     child.room_names[rid] = constraint.name
-                    _apply_cells(child, rid, cand.cells)
+                    _apply_cells(child, grid, rid, cand.cells)
                     child.score += cand.score_delta
                     child.order_placed.append(constraint.name)
                     next_beam.append(child)
@@ -523,7 +735,7 @@ def _beam_search(
                 if comps:
                     comps.sort(key=len, reverse=True)
                     child = st.copy()
-                    _apply_cells(child, rid, comps[0][:target])
+                    _apply_cells(child, grid, rid, comps[0][:target])
                     child.score -= 5.0
                     child.order_placed.append(constraint.name)
                     next_beam.append(child)
@@ -567,7 +779,7 @@ def _greedy_fallback(
             cands = _generate_rect_candidates(state, grid, constraint, plan, rooms_left=1)
             if cands:
                 best = cands[0]
-                _apply_cells(state, rid, best.cells)
+                _apply_cells(state, grid, rid, best.cells)
                 state.score += best.score_delta
                 placed = True
 
@@ -576,7 +788,7 @@ def _greedy_fallback(
             if comps:
                 comps.sort(key=len, reverse=True)
                 cells = comps[0][:target]
-                _apply_cells(state, rid, cells)
+                _apply_cells(state, grid, rid, cells)
                 state.score -= 2.0
                 state.order_placed.append(constraint.name)
                 placed = True
@@ -644,6 +856,15 @@ def validate_grid_layout(
         is_rect = _cells_single_rect(cells)
         if c.must_be_rectangle and not is_rect:
             violations.append(f"「{c.name}」应为矩形但未满足。")
+
+        # Hard rect types: always enforce rectangularity (non-soft)
+        _HARD_RECT_TYPES = frozenset({
+            "卫生间", "主卫", "客卫", "洗手间", "厕所",
+            "主卧", "次卧", "卧室", "儿童房",
+            "阳台",
+        })
+        if c.room_type in _HARD_RECT_TYPES and not is_rect:
+            violations.append(f"「{c.name}」({c.room_type}) 必须为矩形，不可放宽。")
 
         if c.must_touch_outline and not any(_touches_outline(grid, i, j) for i, j in cells):
             violations.append(f"「{c.name}」应靠边但未贴外轮廓。")
@@ -757,6 +978,128 @@ def _must_adjacent(state: SearchState, a: str, b: str) -> bool:
     return False
 
 
+def _partition_search_rooms(
+    rooms: list[RoomPlacementConstraint],
+) -> tuple[list[RoomPlacementConstraint], list[RoomPlacementConstraint]]:
+    """Strong = 贴边/矩形房间；有厨房时餐厅先入 strong 以便厨房贴邻。"""
+    has_kitchen = any(r.room_type == "厨房" for r in rooms)
+    strong: list[RoomPlacementConstraint] = []
+    flex: list[RoomPlacementConstraint] = []
+    for r in rooms:
+        if r.room_type in ("客厅", "起居室", "客餐厅"):
+            flex.append(r)
+        elif r.room_type == "餐厅" and has_kitchen:
+            strong.append(r)
+        elif r.room_type in ("餐厅",):
+            flex.append(r)
+        else:
+            strong.append(r)
+    return strong, flex
+
+
+def _pop_unassigned_component(
+    state: SearchState,
+    grid: GridMap,
+) -> list[tuple[int, int]]:
+    """One 4-connected component of empty inside cells."""
+    start: tuple[int, int] | None = None
+    for j in range(grid.rows):
+        for i in range(grid.cols):
+            if grid.inside[j][i] and state.rid[j][i] == 0:
+                start = (i, j)
+                break
+        if start:
+            break
+    if start is None:
+        return []
+    comp: list[tuple[int, int]] = []
+    q = [start]
+    seen = {start}
+    while q:
+        i, j = q.pop()
+        comp.append((i, j))
+        for ni, nj in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)):
+            if not (0 <= ni < grid.cols and 0 <= nj < grid.rows):
+                continue
+            if not grid.inside[nj][ni] or state.rid[nj][ni] != 0:
+                continue
+            if (ni, nj) in seen:
+                continue
+            seen.add((ni, nj))
+            q.append((ni, nj))
+    return comp
+
+
+def _fill_all_interior_cells(
+    state: SearchState,
+    grid: GridMap,
+    flex_constraints: list[RoomPlacementConstraint],
+    all_constraints: list[RoomPlacementConstraint] | None = None,
+    *,
+    allow_overflow: bool = True,
+    exclude_rids: set[int] | None = None,
+) -> int:
+    """Assign empty inside cells by whole components — keeps rooms connected.
+
+    Prefer flex rooms (客厅/餐厅/书房) to absorb components so that
+    hard-rect rooms don't exceed their area cap and stay rectangular.
+    When allow_overflow=False, only flex rooms absorb (may leave small gaps).
+    """
+    flex_rids = _flex_fill_rids(state)
+    caps = _flex_cap_cells_by_rid(flex_constraints, state)
+    for c in all_constraints or flex_constraints:
+        rid = state.name_to_rid.get(c.name)
+        if rid is None or rid in caps:
+            continue
+        target = max(1, GridMap.target_cells(c.target_area_sqm))
+        caps[rid] = max(4, int(target * (1.0 + min(0.12, c.area_tolerance * 0.4))))
+
+    blocked = exclude_rids or set()
+
+    def _at_cap(oid: int) -> bool:
+        if oid in blocked:
+            return True
+        if oid in flex_rids:
+            return False
+        cap = caps.get(oid)
+        if cap is None:
+            return False
+        return _count_room_rid(state.rid, grid, oid) >= cap
+
+    filled = 0
+    for _ in range(grid.rows * grid.cols + 4):
+        comp = _pop_unassigned_component(state, grid)
+        if not comp:
+            break
+        votes: dict[int, int] = {}
+        for i, j in comp:
+            for ni, nj in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)):
+                if not (0 <= ni < grid.cols and 0 <= nj < grid.rows):
+                    continue
+                oid = state.rid[nj][ni]
+                if oid > 0 and not _at_cap(oid):
+                    votes[oid] = votes.get(oid, 0) + 1
+        if not votes and allow_overflow:
+            # Allow at-cap rooms as last resort so we get 100% fill
+            # But still respect exclude_rids (hard-rect rooms)
+            for i, j in comp:
+                for ni, nj in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)):
+                    if not (0 <= ni < grid.cols and 0 <= nj < grid.rows):
+                        continue
+                    oid = state.rid[nj][ni]
+                    if oid > 0 and oid not in blocked:
+                        votes[oid] = votes.get(oid, 0) + 1
+        if not votes:
+            break
+        flex_votes = {r: v for r, v in votes.items() if r in flex_rids}
+        pool = flex_votes or votes
+        best = max(pool, key=pool.get)
+        for i, j in comp:
+            state.rid[j][i] = best
+        filled += len(comp)
+    return filled
+
+
 def run_grid_search_layout(
     constraint_plan: LayoutConstraintPlan,
     outline: SiteOutline,
@@ -764,13 +1107,7 @@ def run_grid_search_layout(
     poly = [(v.x, v.y) for v in outline.vertices]
     grid = GridMap.from_outline(poly)
 
-    strong: list[RoomPlacementConstraint] = []
-    flex: list[RoomPlacementConstraint] = []
-    for r in constraint_plan.rooms:
-        if r.room_type in ("客厅", "餐厅", "起居室", "客餐厅"):
-            flex.append(r)
-        else:
-            strong.append(r)
+    strong, flex = _partition_search_rooms(constraint_plan.rooms)
 
     state = _beam_search(grid, constraint_plan, strong)
     if state is None:
@@ -797,6 +1134,104 @@ def run_grid_search_layout(
         state, grid, constraint_plan.rooms, constraint_plan,
     )
 
+    _HR = frozenset({
+        "卫生间", "主卫", "客卫", "洗手间", "厕所",
+        "主卧", "次卧", "卧室", "儿童房", "阳台",
+    })
+    hard_rect_rids = {
+        state.name_to_rid[c.name]
+        for c in constraint_plan.rooms
+        if c.room_type in _HR and state.name_to_rid.get(c.name)
+    }
+
+    # Step 1: flex-only fill (客厅/餐厅/书房 absorb freely)
+    n_fill = _fill_all_interior_cells(
+        state, grid, flex, constraint_plan.rooms,
+        allow_overflow=False, exclude_rids=set(),
+    )
+    if n_fill:
+        repair_log.append(f"轮廓内补全：{n_fill} 格")
+
+    # Step 2: allow all rooms (incl. hard-rect) to absorb remaining cells
+    if _count_unassigned(state, grid) > 0:
+        n_fill2 = _fill_all_interior_cells(
+            state, grid, flex, constraint_plan.rooms,
+            allow_overflow=True, exclude_rids=set(),
+        )
+        if n_fill2:
+            repair_log.append(f"完全补全：{n_fill2} 格")
+
+    # Step 3: re-compact any hard-rect rooms that absorbed too many cells
+    from app.services.layout_grid_repair import _compact_to_solid_rect, _cells_single_rect, _heal_disconnected_components
+    for c in constraint_plan.rooms:
+        if c.room_type not in _HR:
+            continue
+        rid = state.name_to_rid.get(c.name)
+        if rid is None:
+            continue
+        max_cells = max(4, int(GridMap.target_cells(c.target_area_sqm) * 1.35))
+        cur = sum(1 for j in range(grid.rows) for i in range(grid.cols)
+                  if grid.inside[j][i] and state.rid[j][i] == rid)
+        if cur > max_cells or not _cells_single_rect(state, grid, rid):
+            _compact_to_solid_rect(state, grid, rid, max_cells=max_cells)
+
+    # Steps 4-6: iterate heal → fill → re-compact until stable
+    for _iter in range(3):
+        healed = _heal_disconnected_components(state, grid, constraint_plan.rooms)
+        if healed:
+            repair_log.extend(healed)
+        if _count_unassigned(state, grid) > 0:
+            nf = _fill_all_interior_cells(
+                state, grid, flex, constraint_plan.rooms,
+                allow_overflow=True, exclude_rids=set(),
+            )
+            if nf:
+                repair_log.append(f"补全(轮{_iter+1})：{nf} 格")
+        for c in constraint_plan.rooms:
+            if c.room_type not in _HR:
+                continue
+            rid = state.name_to_rid.get(c.name)
+            if rid is None:
+                continue
+            max_cells = max(4, int(GridMap.target_cells(c.target_area_sqm) * 1.35))
+            cur = sum(1 for j in range(grid.rows) for i in range(grid.cols)
+                      if grid.inside[j][i] and state.rid[j][i] == rid)
+            if cur > max_cells or not _cells_single_rect(state, grid, rid):
+                _compact_to_solid_rect(state, grid, rid, max_cells=max_cells)
+        if _count_unassigned(state, grid) == 0:
+            break
+
+    # Final fill for any remaining gaps (after last compact freed cells)
+    # Flex rooms (客厅/餐厅) absorb all remaining cells to ensure 100% coverage
+    if _count_unassigned(state, grid) > 0:
+        # Allow all rooms to absorb, then re-compact hard-rect
+        nf = _fill_all_interior_cells(
+            state, grid, flex, constraint_plan.rooms,
+            allow_overflow=True, exclude_rids=set(),
+        )
+        if nf:
+            repair_log.append(f"最终补全：{nf} 格")
+            for c in constraint_plan.rooms:
+                if c.room_type not in _HR:
+                    continue
+                rid = state.name_to_rid.get(c.name)
+                if rid is None:
+                    continue
+                max_cells = max(4, int(GridMap.target_cells(c.target_area_sqm) * 1.35))
+                if not _cells_single_rect(state, grid, rid):
+                    _compact_to_solid_rect(state, grid, rid, max_cells=max_cells)
+            # Fill any cells freed by the last compact
+            nf2 = _fill_all_interior_cells(
+                state, grid, flex, constraint_plan.rooms,
+                allow_overflow=True, exclude_rids=hard_rect_rids,
+            )
+            if nf2:
+                repair_log.append(f"弹性兜底：{nf2} 格")
+    for j in range(grid.rows):
+        for i in range(grid.cols):
+            if grid.inside[j][i]:
+                grid.rid[j][i] = state.rid[j][i]
+
     report = validate_grid_layout(
         state, grid, constraint_plan.rooms, constraint_plan, repair_log=repair_log,
     )
@@ -813,6 +1248,15 @@ def run_grid_search_layout(
             repair2 = auto_repair_grid_layout(
                 state2, grid, constraint_plan.rooms, constraint_plan,
             )
+            n_fill2 = _fill_all_interior_cells(
+                state2, grid, flex, constraint_plan.rooms, allow_overflow=False,
+            )
+            if n_fill2:
+                repair2.append(f"二次补全：{n_fill2} 格")
+            for j in range(grid.rows):
+                for i in range(grid.cols):
+                    if grid.inside[j][i]:
+                        grid.rid[j][i] = state2.rid[j][i]
             report2 = validate_grid_layout(
                 state2, grid, constraint_plan.rooms, constraint_plan, repair_log=repair2,
             )

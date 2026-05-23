@@ -92,8 +92,10 @@ def _export_rooms_from_state(
     _FORCE_RECT_TYPES = frozenset({
         "卫生间", "主卫", "客卫", "洗手间", "厕所",
         "主卧", "次卧", "卧室", "儿童房",
-        "阳台", "厨房",
+        "阳台",
     })
+    # Kitchen can be rect or L-shape
+    _KITCHEN_TYPE = "厨房"
 
     for c in constraints:
         rid = state.name_to_rid.get(c.name)
@@ -109,19 +111,26 @@ def _export_rooms_from_state(
         rt = c.room_type
         is_poly_type = rt in POLYGON_ROOM_TYPES
         must_be_rect = c.must_be_rectangle or rt in _FORCE_RECT_TYPES
+        is_hard_rect = rt in _FORCE_RECT_TYPES
 
-        if must_be_rect:
-            # Always use axis-aligned bbox for rooms that must be rectangular
-            pts = grid.cells_to_bbox_polygon(rid)
-        elif is_poly_type:
-            pts = grid.cells_to_polygon(rid)
-            if len(pts) < 3:
-                pts = grid.cells_to_bbox_polygon(rid)
+        if is_poly_type:
+            pts, shape_kind = grid.export_room_polygon(rid, prefer_rectangle=False)
+            if len(pts) >= 3:
+                shape_kind = "polygon"
         else:
-            pts = grid.cells_to_bbox_polygon(rid)
+            pts, shape_kind = grid.export_room_polygon(
+                rid,
+                prefer_rectangle=must_be_rect,
+            )
+
+        # Hard rect types: force 4-point bbox even if grid is not solid rect
+        if is_hard_rect and (len(pts) != 4 or shape_kind != "rect"):
+            bbox_pts = grid.cells_to_bbox_polygon(rid)
+            if len(bbox_pts) == 4:
+                pts = bbox_pts
+                shape_kind = "rect"
         if len(pts) < 3:
             continue
-        shape_kind = "polygon" if is_poly_type else "rect"
         area = round(n * CELL_AREA, 1)
         rooms.append(
             LayoutRoom(

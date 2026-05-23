@@ -7,6 +7,11 @@ import type { PipelineStage } from "../lib/pipelineStages";
 
 type Message = { role: "user" | "assistant"; content: string };
 
+/** Collapse middle history when conversation exceeds this count */
+const HISTORY_COLLAPSE_AT = 8;
+/** Keep this many latest messages visible while collapsed */
+const VISIBLE_TAIL = 5;
+
 const TEMPLATES = [
   {
     label: "三口之家",
@@ -40,17 +45,30 @@ export function ChatPanel({
   loading,
   pipelineStages = [],
   pipelineActiveIndex = 0,
+  hasSiteOutline = false,
   onSend,
 }: {
   messages: Message[];
   loading: boolean;
   pipelineStages?: PipelineStage[];
   pipelineActiveIndex?: number;
+  /** False when user has not saved a custom site outline yet */
+  hasSiteOutline?: boolean;
   onSend: (text: string) => Promise<void>;
 }) {
   const [input, setInput] = useState("");
   const [showTemplates, setShowTemplates] = useState(true);
+  const [historyCollapsed, setHistoryCollapsed] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const canCollapseHistory = messages.length > HISTORY_COLLAPSE_AT;
+  const hiddenCount = canCollapseHistory
+    ? Math.max(0, messages.length - VISIBLE_TAIL)
+    : 0;
+  const visibleMessages = canCollapseHistory && historyCollapsed
+    ? messages.slice(-VISIBLE_TAIL)
+    : messages;
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -64,6 +82,12 @@ export function ChatPanel({
       setShowTemplates(false);
     }
   }, [messages]);
+
+  useEffect(() => {
+    if (messages.length > HISTORY_COLLAPSE_AT) {
+      setHistoryCollapsed(true);
+    }
+  }, [messages.length]);
 
   return (
     <div className="fpw-card flex h-full flex-col overflow-hidden">
@@ -83,6 +107,18 @@ export function ChatPanel({
         )}
       </div>
 
+      {!hasSiteOutline && (
+        <div className="border-b border-amber-100 bg-amber-50/90 px-4 py-2.5">
+          <div className="flex gap-2">
+            <Icon name="layout" size={14} className="mt-0.5 shrink-0 text-amber-600" />
+            <p className="text-[11px] leading-relaxed text-amber-900">
+              请先在右侧<strong className="font-semibold">外轮廓编辑器</strong>绘制并保存建筑外轮廓。
+              已保存轮廓时，系统以<strong className="font-semibold">轮廓实际面积</strong>为准（与对话中口述面积不一致时会自动采用轮廓面积）。
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Template Quick Buttons */}
       {showTemplates && (
         <div className="border-b border-slate-100 px-4 py-2">
@@ -96,9 +132,9 @@ export function ChatPanel({
                 key={t.label}
                 className="flex items-center gap-1 rounded-lg bg-gradient-to-r from-indigo-50 to-violet-50 px-2.5 py-1.5 text-[11px] font-medium text-indigo-700 hover:from-indigo-100 hover:to-violet-100 transition-all border border-indigo-100"
                 disabled={loading}
-                onClick={async () => {
-                  setShowTemplates(false);
-                  await onSend(t.prompt);
+                onClick={() => {
+                  setInput(t.prompt);
+                  inputRef.current?.focus();
                 }}
               >
                 <Icon name={t.icon} size={10} className="text-indigo-500" />
@@ -109,19 +145,40 @@ export function ChatPanel({
         </div>
       )}
 
-      {/* Messages */}
-      <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-3">
+      {/* Messages — min-h-0 enables wheel scroll inside flex column */}
+      <div
+        ref={scrollRef}
+        className="fpw-chat-scroll min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-y-contain px-4 py-3"
+      >
+        {canCollapseHistory && (
+          <button
+            type="button"
+            className="sticky top-0 z-10 mx-auto flex w-full max-w-[240px] items-center justify-center gap-1 rounded-lg border border-slate-200 bg-white/95 py-1.5 text-[11px] font-medium text-slate-600 shadow-sm backdrop-blur hover:bg-slate-50"
+            onClick={() => setHistoryCollapsed((v) => !v)}
+          >
+            <Icon name={historyCollapsed ? "chevron-down" : "chevron-up"} size={12} />
+            {historyCollapsed
+              ? `展开 ${hiddenCount} 条历史对话`
+              : "收起较早对话"}
+          </button>
+        )}
+
         {messages.length === 0 && !loading && (
           <div className="flex flex-col items-center justify-center py-6 text-center">
             <div className="flex h-12 w-12 items-center justify-center rounded-full bg-slate-100">
               <Icon name="home" size={22} className="text-slate-400" />
             </div>
-            <p className="mt-3 text-sm text-slate-400">点击上方模板快速开始</p>
-            <p className="mt-1 text-xs text-slate-300">或输入你的户型需求</p>
+            <p className="mt-3 text-sm text-slate-400">点击上方模板填入输入框</p>
+            <p className="mt-1 text-xs text-slate-300">确认后点击发送，或直接输入需求</p>
           </div>
         )}
-        {messages.map((message, idx) => (
-          <div key={`${message.role}-${idx}`} className="flex gap-2">
+        {visibleMessages.map((message, idx) => {
+          const globalIdx =
+            canCollapseHistory && historyCollapsed
+              ? messages.length - visibleMessages.length + idx
+              : idx;
+          return (
+          <div key={`${message.role}-${globalIdx}`} className="flex gap-2">
             {message.role === "assistant" && (
               <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-50 mt-1">
                 <Icon name="bot" size={12} className="text-indigo-500" />
@@ -142,7 +199,8 @@ export function ChatPanel({
               </div>
             )}
           </div>
-        ))}
+          );
+        })}
 
         {loading && pipelineStages.length > 0 && (
           <ThinkingPipeline stages={pipelineStages} activeIndex={pipelineActiveIndex} />
@@ -168,8 +226,9 @@ export function ChatPanel({
       <div className="border-t border-slate-100 px-4 py-3">
         <div className="flex gap-2">
           <input
+            ref={inputRef}
             className="flex-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm outline-none transition-colors focus:border-indigo-400 focus:bg-white"
-            placeholder="输入你的户型需求..."
+            placeholder="输入或编辑户型需求，确认后发送..."
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {

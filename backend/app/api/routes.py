@@ -20,6 +20,7 @@ from app.schemas.layout import SiteOutline
 from app.services.drawer_service import DrawerService
 from app.services.layout_service import LayoutService
 from app.services.planner_service import PlannerService
+from app.services.requirement_memory import align_memory_with_outline
 
 router = APIRouter(prefix="/api/v1")
 
@@ -74,8 +75,11 @@ def save_session_outline(session_id: str, body: SiteOutline) -> dict:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     session.site_outline = body
+    merged = dict(session.collected_requirements or {})
+    merged, notices = align_memory_with_outline(merged, body)
+    session.collected_requirements = merged
     repo.save(session)
-    return {"status": "ok", "outline": body.model_dump()}
+    return {"status": "ok", "outline": body.model_dump(), "notices": notices}
 
 
 @router.get("/sessions/{session_id}/outline")

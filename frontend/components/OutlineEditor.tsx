@@ -278,6 +278,12 @@ export function OutlineEditor({
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 py-3">
+        {(!outline || (outline.vertices?.length ?? 0) < 3) && (
+          <div className="mb-3 rounded-lg border border-violet-200 bg-violet-50 px-3 py-2 text-[11px] leading-relaxed text-violet-900">
+            选择预设或点击画布绘制外轮廓，保存后布局按<strong className="font-semibold">轮廓实际面积</strong>生成；
+            若对话里写的面积与轮廓不一致，以轮廓为准。
+          </div>
+        )}
         {/* Presets */}
         <div className="flex flex-wrap gap-1">
           {PRESETS.map((p) => (

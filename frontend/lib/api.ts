@@ -61,13 +61,18 @@ export async function getOutline(sessionId: string): Promise<SiteOutline | null>
   return data.outline ?? null;
 }
 
-export async function saveOutline(sessionId: string, outline: SiteOutline): Promise<void> {
+export async function saveOutline(
+  sessionId: string,
+  outline: SiteOutline,
+): Promise<{ notices: string[] }> {
   const res = await fetch(`${API_BASE}/sessions/${sessionId}/outline`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(outline),
   });
   if (!res.ok) throw new Error("保存外轮廓失败");
+  const data = (await res.json()) as { notices?: string[] };
+  return { notices: data.notices ?? [] };
 }
 
 export async function sendChat(

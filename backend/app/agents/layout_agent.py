@@ -18,11 +18,12 @@ SEMANTIC_LAYOUT_SYSTEM_PROMPT = """你是住宅户型分区顾问。你输出「
 - 不得输出绝对坐标 x/y、polygon、area_sqm
 
 ## 布置原则（与编译器一致）
-- 覆盖用户房间清单中的每个 room_type
-- 布置优先级：① 卫生间/阳台/卧室 ② 厨房 ③ 客厅与餐厅划分剩余大区
-- 相邻房间 center 应接近；公共区靠入口侧（center_y 偏小）
-- 客厅/餐厅 width_ratio、height_ratio 宜大；卫生间/阳台宜小且靠边
-- adjacency_intent：厨房-餐厅 must；卫生间-厨房 avoid
+- 覆盖用户房间清单中的每个 room_type，不得遗漏
+- 布置优先级：① 卫生间/阳台/卧室贴边 ② 餐厅（先于厨房）③ 厨房贴餐厅 ④ 客厅占剩余最大连续区
+- 有厨房且有餐厅时：厨房与餐厅 center 应相邻（共享边），厨房-餐厅 adjacency_intent 必须为 must
+- 公共区靠入口侧（center_y 偏小）；客厅 width_ratio、height_ratio 宜大
+- adjacency_intent 至少包含：厨房-餐厅(must)、餐厅-客厅(prefer)、客厅-阳台(prefer)（按实际房间存在）
+- 卫生间与厨房 avoid；卧室区与厨房 avoid
 - 只输出 JSON"""
 
 
@@ -48,12 +49,17 @@ def build_layout_prompt(plan, outline_vertices, entrance_edge, outline_area, *, 
         notes = f"，{item.notes}" if getattr(item, "notes", None) else ""
         parts.append(f"- {item.room_type} x{item.count}（目标 {item.target_area_sqm}㎡{notes}）")
     if plan.adjacency_graph:
-        parts.append("\n## 邻接关系")
+        parts.append("\n## 邻接关系（矢量布置硬约束）")
         for edge in plan.adjacency_graph:
             parts.append(
                 f"- {edge.source} → {edge.target}（{edge.relation}）"
                 + (f"：{edge.description}" if edge.description else "")
             )
+    else:
+        parts.append(
+            "\n## 邻接关系\n"
+            "- 若含厨房与餐厅：必须在 adjacency_intent 中声明 厨房-餐厅 为 must"
+        )
     circ = plan.circulation or {}
     if circ.get("main_route"):
         parts.append(f"\n## 动线\n主路径：{circ.get('main_route')}")
@@ -64,6 +70,10 @@ def build_layout_prompt(plan, outline_vertices, entrance_edge, outline_area, *, 
         for err in validation_errors:
             parts.append(f"- {err}")
     parts.append(
+        "\n## 矢量布置（Method A）约束\n"
+        "- 各房间分区须填满外轮廓内部，勿留大块未分区空白\n"
+        "- 有厨房与餐厅时：餐厅条带应紧邻厨房条带，adjacency_intent 中 厨房-餐厅 为 must\n"
+        "- 客厅通常为最大公共空间，面积宜接近 space_program 中的目标值\n"
         "\n请输出 SemanticLayoutPlan JSON（每个 placement 含 center_x/center_y/width_ratio/height_ratio）。"
     )
     return "\n".join(parts)

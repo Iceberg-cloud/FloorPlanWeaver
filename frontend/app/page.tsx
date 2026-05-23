@@ -199,6 +199,18 @@ export default function HomePage() {
     }
   };
 
+  const appendNotices = (notices: string[] | undefined) => {
+    if (!notices?.length) return;
+    const block = notices.join("\n");
+    setMessages((prev) => {
+      const last = prev[prev.length - 1];
+      if (last?.role === "assistant" && last.content.includes(notices[0]!)) {
+        return prev;
+      }
+      return [...prev, { role: "assistant", content: block }];
+    });
+  };
+
   const consumeResponse = (res: ChatResponse) => {
     const normalizedPlanner = normalizePlanner(res.planner) ?? res.planner;
     setPlanner(normalizedPlanner);
@@ -219,6 +231,7 @@ export default function HomePage() {
           content: `绘图阶段失败：${errorText}\n你可以修改需求后重试。`,
         },
       ]);
+      appendNotices(res.notices);
       return;
     }
     if (res.status === "completed") {
@@ -254,6 +267,7 @@ export default function HomePage() {
           content: buildCompletionMessage(res, drawMethod),
         },
       ]);
+      appendNotices(res.notices);
       return;
     }
     if (res.status === "collecting" && res.planner.agent_state === "ASK_FOR_MORE") {
@@ -263,6 +277,7 @@ export default function HomePage() {
         ...prev,
         { role: "assistant", content: questions.join("\n") },
       ]);
+      appendNotices(res.notices);
     }
   };
 
@@ -326,8 +341,19 @@ export default function HomePage() {
     const sid = await ensureSession();
     if (!sid) return;
     try {
-      await saveOutline(sid, newOutline);
+      const { notices } = await saveOutline(sid, newOutline);
       setOutline(newOutline);
+      if (notices.length > 0) {
+        appendNotices(notices);
+      } else if (newOutline.total_area_sqm) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: `外轮廓已保存（约 ${newOutline.total_area_sqm}㎡）。后续规划与布局将以此面积为准。`,
+          },
+        ]);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setRuntimeErrorRaw(`保存轮廓失败：${message}`);
@@ -463,6 +489,7 @@ export default function HomePage() {
                 loading={loading}
                 pipelineStages={pipelineStages}
                 pipelineActiveIndex={pipelineActiveIndex}
+                hasSiteOutline={Boolean(outline?.vertices && outline.vertices.length >= 3)}
                 onSend={onSend}
               />
             </div>

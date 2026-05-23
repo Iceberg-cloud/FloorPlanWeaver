@@ -33,8 +33,10 @@ def validate_layout(
                             f"房间「{room.name}」顶点 {i} ({pt.x:.1f},{pt.y:.1f}) 在轮廓外。"
                         )
 
-    # 2. Overlap check (grid uses cell partitioning, no polygon overlap test)
-    if layout.compile_method != "grid":
+    # 2. Overlap check — legacy grid skipped; grid_search uses boundary export
+    if layout.compile_method == "grid_search":
+        errors.extend(_grid_search_polygon_overlap_errors(layout.rooms))
+    elif layout.compile_method != "grid":
         for i, r1 in enumerate(layout.rooms):
             for j in range(i + 1, len(layout.rooms)):
                 r2 = layout.rooms[j]
@@ -138,6 +140,54 @@ def _edge_intersection(
     if 0 <= t <= 1 and 0 <= u <= 1:
         return (p1[0] + t * d1x, p1[1] + t * d1y)
     return None
+
+
+def _grid_search_polygon_overlap_errors(rooms) -> list[str]:
+    """True overlap: one room's polygon contains another room's interior sample point."""
+    from app.services.layout_geometry import point_in_polygon
+
+    errors: list[str] = []
+    if len(rooms) < 2:
+        return errors
+
+    def _sample_points(poly: list[tuple[float, float]], n: int = 5) -> list[tuple[float, float]]:
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        pts: list[tuple[float, float]] = []
+        for si in range(n):
+            for sj in range(n):
+                tx = min_x + (max_x - min_x) * (si + 0.5) / n
+                ty = min_y + (max_y - min_y) * (sj + 0.5) / n
+                if point_in_polygon(tx, ty, poly):
+                    pts.append((tx, ty))
+        return pts
+
+    for i, r1 in enumerate(rooms):
+        p1 = [(p.x, p.y) for p in r1.polygon]
+        if len(p1) < 3:
+            continue
+        samples1 = _sample_points(p1)
+        for j in range(i + 1, len(rooms)):
+            r2 = rooms[j]
+            p2 = [(p.x, p.y) for p in r2.polygon]
+            if len(p2) < 3:
+                continue
+            for pt in samples1:
+                if point_in_polygon(pt[0], pt[1], p2):
+                    errors.append(
+                        f"房间「{r1.name}」与「{r2.name}」导出图形重叠（网格单元不重叠，属显示多边形问题）。"
+                    )
+                    break
+            else:
+                for pt in _sample_points(p2):
+                    if point_in_polygon(pt[0], pt[1], p1):
+                        errors.append(
+                            f"房间「{r1.name}」与「{r2.name}」导出图形重叠（网格单元不重叠，属显示多边形问题）。"
+                        )
+                        break
+    return errors
 
 
 def _polygons_overlap(

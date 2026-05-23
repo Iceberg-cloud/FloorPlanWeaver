@@ -217,6 +217,24 @@ body {
   line-height: 1.5;
 }
 
+/* Chat message list: wheel scroll inside flex panel */
+.fpw-chat-scroll {
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-gutter: stable;
+}
+.fpw-chat-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.fpw-chat-scroll::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+.fpw-chat-scroll::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
 /* ---- Icon button ---- */
 .fpw-icon-btn {
   display: inline-flex;
